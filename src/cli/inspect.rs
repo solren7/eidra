@@ -6,7 +6,7 @@
 use crate::{
     domain::{
         reminder::ReminderRepository,
-        repository::SessionRepository,
+        repository::{SessionRepository, SkillRepository},
         run::RunRepository,
         task::{TaskRepository, TaskStatus},
     },
@@ -159,6 +159,51 @@ pub async fn run_inspect(db_url: &str, id: &str) -> anyhow::Result<()> {
         } else {
             println!("      error  {}", oneline(&s.error, 120));
         }
+    }
+    Ok(())
+}
+
+/// Prune the run ledger: delete runs (and their tool steps) started before
+/// `cutoff` (unix seconds). The ledger accumulates like messages, so this is the
+/// operator's manual trim — `run prune` resolves either `--before` or `--keep`
+/// into a cutoff before calling this.
+pub async fn run_prune(db_url: &str, cutoff: i64) -> anyhow::Result<()> {
+    let db = Db::connect(db_url).await?;
+    let removed = RunRepository::prune(&db, cutoff).await?;
+    if removed == 0 {
+        println!("No runs older than {}; nothing pruned.", local_time(cutoff));
+    } else {
+        println!(
+            "Pruned {removed} run(s) started before {}.",
+            local_time(cutoff)
+        );
+    }
+    Ok(())
+}
+
+/// Resolve the `--keep N` form to a cutoff timestamp: keep the N most recent
+/// runs, returning the `started_at` of the first run to drop (everything older
+/// is pruned). `None` = fewer than N+1 runs exist, so there's nothing to prune.
+pub async fn run_keep_cutoff(db_url: &str, keep: usize) -> anyhow::Result<Option<i64>> {
+    let db = Db::connect(db_url).await?;
+    // `list` already returns most-recent-first; ask for one more than we keep so
+    // the (keep+1)-th run's start time becomes the cutoff.
+    let runs = RunRepository::list(&db, keep + 1).await?;
+    Ok(runs.get(keep).map(|r| r.started_at))
+}
+
+/// List registered skills (name, protected flag, and a one-line description).
+pub async fn skill_list(db_url: &str) -> anyhow::Result<()> {
+    let db = Db::connect(db_url).await?;
+    let mut skills = SkillRepository::list(&db).await?;
+    if skills.is_empty() {
+        println!("No skills registered.");
+        return Ok(());
+    }
+    skills.sort_by(|a, b| a.name.cmp(&b.name));
+    for s in skills {
+        let lock = if s.protected { " 🔒" } else { "" };
+        println!("{}{}  {}", s.name, lock, oneline(&s.description, 80));
     }
     Ok(())
 }

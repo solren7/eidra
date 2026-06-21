@@ -154,6 +154,13 @@ impl Approver for ChatApprover {
             return false;
         };
 
+        // No human to answer (HTTP API, detached REPL context): deny rather than
+        // prompt a sink no one reads and wait out the timeout.
+        if !ctx.interactive {
+            warn!(summary = %request.summary, "approval auto-denied (non-interactive session)");
+            return false;
+        }
+
         // Already approved this kind of action for the session?
         if let Some(key) = &request.scope_key {
             if self.state.is_session_approved(&ctx.session_id, key) {
@@ -344,7 +351,9 @@ impl GatewayDispatcher {
             let _ = sink.send("正在生成微信登录二维码，请稍候…").await;
             match login.run(sink.clone()).await {
                 Ok(user_id) => {
-                    let _ = sink.send(&format!("✅ 微信已连接（{user_id}），现在可以直接对话了。")).await;
+                    let _ = sink
+                        .send(&format!("✅ 微信已连接（{user_id}），现在可以直接对话了。"))
+                        .await;
                 }
                 Err(error) => {
                     warn!(%error, "wechat login via chat failed");
@@ -371,6 +380,8 @@ impl GatewayDispatcher {
         let ctx = SessionContext {
             session_id: session.clone(),
             sink: sink.clone(),
+            // A chat channel has a human who can answer an approval prompt.
+            interactive: true,
         };
         tokio::spawn(async move {
             let reply = match with_session(ctx, this.handler.handle(&session, input)).await {

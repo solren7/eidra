@@ -6,7 +6,7 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::domain::{
-    approval::{ApprovalRequest, Approver},
+    approval::{ActionRef, ApprovalRequest, Approver},
     tool::Tool,
     workspace::Workspace,
 };
@@ -124,7 +124,11 @@ impl Tool for FileTool {
                     content.len(),
                     args.path
                 ))
-                .with_scope_key("file:write");
+                .with_scope_key("file:write")
+                .with_action(ActionRef::File {
+                    path: Path::new(&args.path).to_path_buf(),
+                    write: true,
+                });
                 if !self.approver.approve(&request).await {
                     return Ok("Write rejected by user; nothing was changed.".to_string());
                 }

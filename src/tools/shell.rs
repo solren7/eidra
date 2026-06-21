@@ -5,7 +5,7 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::domain::{
-    approval::{ApprovalRequest, Approver},
+    approval::{ActionRef, ApprovalRequest, Approver},
     tool::Tool,
     workspace::Workspace,
 };
@@ -202,13 +202,17 @@ impl Tool for ShellTool {
         // prompt the user; everything else is `Risk::Safe` and an interactive
         // approver lets it through without asking.
         let summary = format!("run shell command: {}", args.command);
+        let action = ActionRef::Shell {
+            command: args.command.clone(),
+        };
         let request = match dangerous_pattern(&args.command) {
             Some(pattern) => ApprovalRequest::dangerous(
                 summary,
                 format!("matched dangerous pattern `{pattern}`"),
             )
-            .with_scope_key(format!("shell:{pattern}")),
-            None => ApprovalRequest::safe(summary),
+            .with_scope_key(format!("shell:{pattern}"))
+            .with_action(action),
+            None => ApprovalRequest::safe(summary).with_action(action),
         };
         if !self.approver.approve(&request).await {
             return Ok("Command rejected by user; nothing was run.".to_string());

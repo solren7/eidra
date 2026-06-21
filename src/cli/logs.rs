@@ -14,7 +14,11 @@ use std::time::Duration;
 const FOLLOW_POLL: Duration = Duration::from_millis(500);
 
 pub fn run(lines: usize, follow: bool, stdout: bool) -> anyhow::Result<()> {
-    let name = if stdout { "gateway.log" } else { "gateway.err.log" };
+    let name = if stdout {
+        "gateway.log"
+    } else {
+        "gateway.err.log"
+    };
     let path = crate::config::shion_home().join("logs").join(name);
     if !path.exists() {
         anyhow::bail!(

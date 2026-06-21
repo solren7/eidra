@@ -93,6 +93,7 @@ pub struct ShionEnv {
     pub aux_model: Option<String>,
     pub schedule: Option<String>,
     pub briefing_schedule: Option<String>,
+    pub briefing_workdays_only: Option<bool>,
     pub max_turns: Option<usize>,
     pub max_tool_result_bytes: Option<usize>,
     pub review_interval: Option<usize>,
@@ -225,6 +226,24 @@ pub fn briefing_schedule() -> Option<String> {
         .or_else(|| FileConfig::load(&shion_home()).briefing_schedule)
 }
 
+/// Whether the daily briefing should only fire on Chinese working days
+/// (statutory holidays and 调休-adjusted weekends respected): `SHION_BRIEFING_WORKDAYS_ONLY`
+/// env > config.toml `briefing_workdays_only` > `false`. When true, the briefing
+/// sweep is wrapped in a `WorkdayGated` that skips non-workdays.
+pub fn briefing_workdays_only() -> bool {
+    ShionEnv::load_lenient()
+        .briefing_workdays_only
+        .or_else(|| FileConfig::load(&shion_home()).briefing_workdays_only)
+        .unwrap_or(false)
+}
+
+/// Directory holding the cached Chinese workday calendar, one `{year}.json` per
+/// year: `<shion_home>/workdays/`. Disposable — delete a file to force a
+/// re-fetch from the holiday API.
+pub fn workday_cache_dir() -> PathBuf {
+    shion_home().join("workdays")
+}
+
 /// Settings read from `~/.shion/config.toml`. All fields are optional;
 /// absent keys fall back to `SHION_*` env vars then built-in defaults.
 /// API keys must never appear here — keep them in `~/.shion/.env`.
@@ -240,6 +259,9 @@ pub struct FileConfig {
     /// 5-field Unix cron expression for the daily briefing. Unset = disabled
     /// (the briefing is opt-in; e.g. `0 8 * * *` for 8am daily).
     pub briefing_schedule: Option<String>,
+    /// Gate the daily briefing to Chinese working days only (statutory holidays
+    /// and 调休-adjusted weekends respected). Default false.
+    pub briefing_workdays_only: Option<bool>,
     /// Maximum tool-calling round-trips per user turn (default: 30).
     pub max_turns: Option<usize>,
     /// Byte cap on a tool result handed back to the LLM, a global backstop
@@ -249,6 +271,91 @@ pub struct FileConfig {
     /// Ingress channel declarations (`[channels.*]` tables), shaped after
     /// hermes-agent's per-platform config blocks.
     pub channels: Option<ChannelsFileConfig>,
+    /// Configurable permission policy (`[policy]` + `[[policy.rule]]`).
+    pub policy: Option<PolicyFileConfig>,
+}
+
+/// `[policy]` table: the configurable permission layer (roadmap §3). Parsed into
+/// a `domain::policy::Policy` by [`policy_config`].
+#[derive(Debug, Deserialize, Default)]
+#[serde(default)]
+pub struct PolicyFileConfig {
+    /// Fallback for a `Risk::Normal` action no rule matches: `ask` (default,
+    /// = current behavior), `deny`, or `allow`. `Risk::Dangerous` always asks
+    /// unless an explicit `include_dangerous` allow rule grants it.
+    pub default_normal: Option<String>,
+    /// `[[policy.rule]]` entries, evaluated deny-first.
+    pub rule: Vec<PolicyRuleFileConfig>,
+}
+
+/// One `[[policy.rule]]` entry.
+#[derive(Debug, Deserialize, Default)]
+#[serde(default)]
+pub struct PolicyRuleFileConfig {
+    /// `shell` | `file` | `network` | `homeassistant`.
+    pub category: String,
+    /// `prefix` | `suffix` | `exact` | `contains`.
+    #[serde(rename = "match")]
+    pub matcher: String,
+    /// The string compared against the action's target (command/path/host/...).
+    pub value: String,
+    /// `allow` | `deny`.
+    pub effect: String,
+    /// `file`-only: `read` | `write`. Omit = either.
+    pub access: Option<String>,
+    /// Channel scope (`["cli", "feishu"]`). Omit/empty = all channels.
+    pub channels: Option<Vec<String>>,
+    /// Let an `allow` rule grant `Risk::Dangerous` actions too (default false).
+    pub include_dangerous: Option<bool>,
+}
+
+/// Resolve the permission policy from `~/.shion/config.toml`. Absent `[policy]`
+/// (or any invalid rule) degrades to the empty policy — i.e. the current
+/// interactive-only behavior, never more permissive.
+pub fn policy_config() -> crate::domain::policy::Policy {
+    FileConfig::load(&shion_home())
+        .policy
+        .map(build_policy)
+        .unwrap_or_default()
+}
+
+fn build_policy(cfg: PolicyFileConfig) -> crate::domain::policy::Policy {
+    use crate::domain::policy::{Policy, Verdict};
+
+    let default_normal = cfg
+        .default_normal
+        .as_deref()
+        .and_then(Verdict::parse_default)
+        .unwrap_or(Verdict::Ask);
+
+    let mut rules = Vec::new();
+    for (i, r) in cfg.rule.into_iter().enumerate() {
+        match build_rule(r) {
+            Some(rule) => rules.push(rule),
+            None => eprintln!("shion: [policy] rule #{i} is invalid, ignoring it"),
+        }
+    }
+    Policy::new(rules, default_normal)
+}
+
+fn build_rule(r: PolicyRuleFileConfig) -> Option<crate::domain::policy::Rule> {
+    use crate::domain::policy::{Access, Category, Effect, Matcher, Rule};
+
+    if r.value.is_empty() {
+        return None;
+    }
+    Some(Rule {
+        channels: r.channels.filter(|c| !c.is_empty()),
+        category: Category::parse(&r.category)?,
+        matcher: Matcher::parse(&r.matcher)?,
+        value: r.value,
+        access: match r.access {
+            Some(a) => Some(Access::parse(&a)?),
+            None => None,
+        },
+        effect: Effect::parse(&r.effect)?,
+        include_dangerous: r.include_dangerous.unwrap_or(false),
+    })
 }
 
 /// `[channels]` namespace in config.toml: one optional table per transport.
@@ -259,6 +366,7 @@ pub struct ChannelsFileConfig {
     pub telegram: Option<TelegramFileConfig>,
     pub wechat: Option<WeChatFileConfig>,
     pub homeassistant: Option<HomeAssistantChannelFileConfig>,
+    pub api: Option<ApiFileConfig>,
 }
 
 /// `[channels.homeassistant]` table: HA as an event-ingress channel. The URL
@@ -445,6 +553,66 @@ pub fn telegram_config() -> anyhow::Result<Option<TelegramConfig>> {
         allowed_chats: telegram.allowed_chats,
         require_mention: telegram.require_mention.unwrap_or(true),
         home_chat: telegram.home_chat,
+    }))
+}
+
+/// Default loopback bind address for the HTTP API channel. Loopback-only by
+/// default so the API isn't reachable off-host without an explicit override.
+const DEFAULT_API_BIND: &str = "127.0.0.1";
+/// Default API port (kept distinct from hermes' 8642 to avoid a same-host clash).
+const DEFAULT_API_PORT: u16 = 8765;
+
+/// `[channels.api]` table: the OpenAI-compatible + dashboard HTTP API. The
+/// bearer key never lives here — it is read from `API_SERVER_KEY` (in
+/// `~/.shion/.env`), like the other channels' credentials.
+#[derive(Debug, Deserialize, Default)]
+#[serde(default)]
+pub struct ApiFileConfig {
+    pub enabled: bool,
+    /// Bind address (default `127.0.0.1`). Set `0.0.0.0` only behind a trusted
+    /// proxy — the key is the only auth.
+    pub bind: Option<String>,
+    /// Listen port (default 8765).
+    pub port: Option<u16>,
+}
+
+/// `API_*` server credentials from the environment (`~/.shion/.env`).
+#[derive(Debug, Deserialize, Default)]
+struct ApiEnv {
+    server_key: Option<String>,
+}
+
+/// Resolved HTTP API channel settings.
+pub struct ApiConfig {
+    pub bind: String,
+    pub port: u16,
+    pub server_key: String,
+}
+
+/// Resolve the HTTP API channel config. `None` means the channel is not
+/// enabled; an error means it is enabled but `API_SERVER_KEY` is missing
+/// (fail fast at startup — a keyless API is never started).
+pub fn api_config() -> anyhow::Result<Option<ApiConfig>> {
+    let file = FileConfig::load(&shion_home());
+    let Some(api) = file.channels.and_then(|c| c.api) else {
+        return Ok(None);
+    };
+    if !api.enabled {
+        return Ok(None);
+    }
+    let env: ApiEnv = envy::prefixed("API_").from_env().unwrap_or_default();
+    let server_key = env.server_key.filter(|s| !s.is_empty()).ok_or_else(|| {
+        anyhow::anyhow!(
+            "[channels.api] is enabled but API_SERVER_KEY is not set (put it in ~/.shion/.env)"
+        )
+    })?;
+    Ok(Some(ApiConfig {
+        bind: api
+            .bind
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| DEFAULT_API_BIND.to_string()),
+        port: api.port.unwrap_or(DEFAULT_API_PORT),
+        server_key,
     }))
 }
 

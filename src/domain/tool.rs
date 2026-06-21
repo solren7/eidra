@@ -21,6 +21,20 @@ pub trait Tool: Send + Sync {
     /// the LLM, or an empty string for argument-less tools.
     async fn execute(&self, input: String) -> anyhow::Result<String>;
 
+    /// Whether `execute` is safe to retry after a transient failure whose
+    /// side-effect status is *ambiguous* — a timeout or 5xx that may already
+    /// have landed and applied server-side. Read-only tools (`web_fetch`,
+    /// `web_search`) return `true`; any tool that can mutate external state
+    /// keeps the default `false`, so a retry can never double-apply an effect
+    /// (e.g. fire a Home Assistant service or run a shell command twice).
+    ///
+    /// Connection-level failures (the request provably never reached the
+    /// server — connection refused, DNS failure) are retried regardless of
+    /// this flag; see `services::tool_registry::execute_isolated`.
+    fn idempotent(&self) -> bool {
+        false
+    }
+
     /// Sanitize the raw arguments before they are written to the run ledger
     /// (`services::tool_registry::execute_isolated`). The ledger stores tool
     /// args verbatim by default (this identity impl); tools carrying sensitive

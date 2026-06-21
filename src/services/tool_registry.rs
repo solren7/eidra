@@ -22,18 +22,25 @@ use crate::domain::{
 pub struct SessionContext {
     pub session_id: String,
     pub sink: Arc<dyn ReplySink>,
+    /// Whether a human can answer a mid-turn approval prompt on this channel.
+    /// Chat channels set this `true`; non-interactive callers (the REPL's
+    /// detached context, the HTTP API) set it `false` so a `Risk::Normal` /
+    /// `Risk::Dangerous` request is denied immediately instead of waiting out
+    /// the approval timeout against a sink no one is reading.
+    pub interactive: bool,
 }
 
 impl SessionContext {
     /// A context that knows the session but cannot talk back mid-turn (its sink
-    /// is a no-op). Used by the REPL and any caller that has a session id but no
-    /// channel to prompt on — enough for session-scoped tools like `todo`, while
-    /// a mid-turn approval prompt simply goes nowhere (the REPL gates approvals
-    /// at the TTY, not through this sink).
+    /// is a no-op, and it is non-interactive). Used by the REPL and any caller
+    /// that has a session id but no channel to prompt on — enough for
+    /// session-scoped tools like `todo`, while a mid-turn approval prompt is
+    /// auto-denied (the REPL gates approvals at the TTY, not through this sink).
     pub fn detached(session_id: &str) -> Self {
         Self {
             session_id: session_id.to_string(),
             sink: Arc::new(NoopSink),
+            interactive: false,
         }
     }
 }
@@ -183,50 +190,190 @@ fn cap_tool_result(mut out: String) -> String {
     out
 }
 
+/// Total attempts for a tool whose failure is judged retryable (1 initial +
+/// retries). Kept a constant, not config: transient-error retry is an internal
+/// robustness backstop, not a user tuning knob. Promote to config only when a
+/// real consumer needs to vary it.
+const TOOL_RETRY_MAX_ATTEMPTS: usize = 3;
+/// Backoff before each retry, indexed by the retry number (the first retry
+/// waits the first entry, etc.); the last entry is reused beyond its length.
+const TOOL_RETRY_BACKOFF_MS: [u64; 2] = [250, 750];
+
+/// Soft per-turn tool-call budget (backstop). rig's `max_turns` (default 30)
+/// bounds *round-trips*, but a single round can request many tools at once;
+/// this caps the *total* calls per turn so a runaway loop can't fan out
+/// unbounded. Set generously above any legitimate turn — promote to config if a
+/// real consumer needs to tune it. Enforced in [`execute_isolated`] against the
+/// run-ledger seq, so it applies only to recorded turns (the main agent), never
+/// to aux sub-agents or sweeps (which have no counter and no tool loop anyway).
+const MAX_TOOL_CALLS_PER_TURN: i64 = 100;
+
+/// How a failed tool call may be retried. Classified from the error *text*
+/// only: tools format their `reqwest` errors into `anyhow!("…: {e}")`, which
+/// drops the typed error so the source chain can't be downcast — heuristic
+/// string matching is all that survives. Deliberately conservative: an error
+/// that matches nothing is [`Retry::No`] (never retried).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Retry {
+    /// Don't retry — terminal (bad arguments, denied, blocked) or unknown.
+    No,
+    /// The request provably never reached the server (connection refused, DNS
+    /// failure). Safe to retry for *any* tool — no side effect can have landed.
+    ConnLevel,
+    /// Landed-or-not is ambiguous (timeout, 5xx, rate-limit). Retry only an
+    /// idempotent tool, so a side effect is never applied twice.
+    Ambiguous,
+}
+
+/// Markers that mean the connection never established — the request did not
+/// reach the server, so retrying cannot double-apply a side effect.
+const CONN_LEVEL_MARKERS: &[&str] = &[
+    "connection refused",
+    "dns error",
+    "failed to lookup address",
+    "name resolution",
+    "could not resolve",
+    "no such host",
+];
+/// Markers whose side-effect status is ambiguous — the request may have landed
+/// and applied before the failure surfaced. Retried for idempotent tools only.
+const AMBIGUOUS_MARKERS: &[&str] = &[
+    "timed out",
+    "timeout",
+    "error sending request",
+    "connection reset",
+    "broken pipe",
+    "temporarily unavailable",
+    "http 502",
+    "http 503",
+    "http 504",
+    "http 429",
+    "502 bad gateway",
+    "503 service",
+    "504 gateway",
+    "429 too many",
+];
+
+fn classify_error(err: &anyhow::Error) -> Retry {
+    let msg = format!("{err:#}").to_lowercase();
+    if CONN_LEVEL_MARKERS.iter().any(|m| msg.contains(m)) {
+        Retry::ConnLevel
+    } else if AMBIGUOUS_MARKERS.iter().any(|m| msg.contains(m)) {
+        Retry::Ambiguous
+    } else {
+        Retry::No
+    }
+}
+
+/// Whether a failed call should be retried, given the tool's idempotency.
+fn should_retry(err: &anyhow::Error, idempotent: bool) -> bool {
+    match classify_error(err) {
+        Retry::No => false,
+        Retry::ConnLevel => true,
+        Retry::Ambiguous => idempotent,
+    }
+}
+
 /// Runs a tool on its own tokio task, isolated from the caller. This keeps
 /// tool work off the chat task's thread and — because `JoinHandle` catches
 /// panics — turns a panicking tool into an error reply instead of a process
 /// exit. Used by both invocation paths: the keyword-routed registry above and
 /// the LLM function-calling adapter (`infra::rig_tool::RigTool`).
+///
+/// A transient failure (a network blip mid-fetch, Home Assistant not yet up) is
+/// retried with backoff per [`should_retry`]. The run ledger still records a
+/// single step for the call's final outcome — the retry is a robustness detail,
+/// not extra audit rows — and one seq is claimed per call regardless, so the
+/// tool-call budget counts logical calls, not attempts. Panics are never
+/// retried (their error text matches no transient marker).
 pub async fn execute_isolated(tool: Arc<dyn Tool>, input: String) -> anyhow::Result<String> {
     let name = tool.name();
 
     // Run-ledger bookkeeping (only when this turn is being recorded). Capture
-    // the redacted args and seq up front: the raw `input` is moved into the
-    // spawned task below, and the seq must be claimed before the tool runs so
-    // the span and the persisted step agree.
+    // the redacted args and seq up front: the raw `input` is cloned per attempt
+    // below, and the seq must be claimed before the tool runs so the span and
+    // the persisted step agree.
     let run = current_run();
     let ledger = run.as_ref().map(|r| (r.clone(), r.next_seq()));
     let redacted_args = ledger.as_ref().map(|_| tool.redact_args(&input));
     let started_at = now();
-
-    // Span so the tool's own logs carry the run's `seq`/`name`. Spans don't
-    // cross `tokio::spawn` on their own — instrument the spawned future.
     let seq_field = ledger.as_ref().map(|(_, s)| *s).unwrap_or(-1);
-    let span = info_span!("tool", name, seq = seq_field);
 
     // Carry the turn's session context into the spawned task; `tokio::spawn`
     // starts a fresh task that wouldn't otherwise inherit the task-local.
-    let join = match current_session() {
-        Some(ctx) => tokio::spawn(
-            SESSION
-                .scope(ctx, async move { tool.execute(input).await })
-                .instrument(span),
-        ),
-        None => tokio::spawn(async move { tool.execute(input).await }.instrument(span)),
-    };
-    let result = match join.await {
-        Ok(result) => result,
-        Err(join_err) if join_err.is_panic() => {
-            let panic = join_err.into_panic();
-            let msg = panic
-                .downcast_ref::<String>()
-                .map(String::as_str)
-                .or_else(|| panic.downcast_ref::<&str>().copied())
-                .unwrap_or("unknown panic");
-            Err(anyhow::anyhow!("tool `{name}` panicked: {msg}"))
+    let session_ctx = current_session();
+
+    // Soft tool-call budget (backstop): once this turn has reached
+    // MAX_TOOL_CALLS_PER_TURN calls, refuse further ones with an error the
+    // model sees instead of executing them, so a runaway loop can't fan out
+    // unbounded. Inactive without a run ledger (seq_field = -1 < the cap).
+    let result = if seq_field >= MAX_TOOL_CALLS_PER_TURN {
+        warn!(
+            tool = name,
+            seq = seq_field,
+            budget = MAX_TOOL_CALLS_PER_TURN,
+            "tool-call budget reached for this turn; refusing"
+        );
+        Err(anyhow::anyhow!(
+            "tool-call budget of {MAX_TOOL_CALLS_PER_TURN} reached for this turn; \
+             stop calling tools and answer the user with what you already have."
+        ))
+    } else {
+        let mut attempt: usize = 0;
+        loop {
+            // Span so the tool's own logs carry the run's `seq`/`name`. Spans don't
+            // cross `tokio::spawn` on their own — instrument the spawned future. A
+            // fresh span per attempt keeps each retry's logs distinct.
+            let span = info_span!("tool", name, seq = seq_field, attempt);
+            let tool_attempt = tool.clone();
+            let input_attempt = input.clone();
+            let join = match session_ctx.clone() {
+                Some(ctx) => tokio::spawn(
+                    SESSION
+                        .scope(
+                            ctx,
+                            async move { tool_attempt.execute(input_attempt).await },
+                        )
+                        .instrument(span),
+                ),
+                None => tokio::spawn(
+                    async move { tool_attempt.execute(input_attempt).await }.instrument(span),
+                ),
+            };
+            let attempt_result = match join.await {
+                Ok(result) => result,
+                Err(join_err) if join_err.is_panic() => {
+                    let panic = join_err.into_panic();
+                    let msg = panic
+                        .downcast_ref::<String>()
+                        .map(String::as_str)
+                        .or_else(|| panic.downcast_ref::<&str>().copied())
+                        .unwrap_or("unknown panic");
+                    Err(anyhow::anyhow!("tool `{name}` panicked: {msg}"))
+                }
+                Err(join_err) => Err(anyhow::anyhow!("tool `{name}` was cancelled: {join_err}")),
+            };
+
+            match &attempt_result {
+                Err(error)
+                    if attempt + 1 < TOOL_RETRY_MAX_ATTEMPTS
+                        && should_retry(error, tool.idempotent()) =>
+                {
+                    let delay = TOOL_RETRY_BACKOFF_MS[attempt.min(TOOL_RETRY_BACKOFF_MS.len() - 1)];
+                    warn!(
+                        tool = name,
+                        seq = seq_field,
+                        attempt = attempt + 1,
+                        delay_ms = delay,
+                        error = %format!("{error:#}"),
+                        "transient tool error; retrying"
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+                    attempt += 1;
+                }
+                _ => break attempt_result,
+            }
         }
-        Err(join_err) => Err(anyhow::anyhow!("tool `{name}` was cancelled: {join_err}")),
     };
 
     // Record the step — best-effort, never affecting the tool's own result.
@@ -307,6 +454,12 @@ mod tests {
         }
         async fn steps(&self, _run_id: &str) -> anyhow::Result<Vec<RunStep>> {
             Ok(Vec::new())
+        }
+        async fn prune(&self, _cutoff: i64) -> anyhow::Result<usize> {
+            Ok(0)
+        }
+        async fn reconcile_interrupted(&self, _now: i64) -> anyhow::Result<usize> {
+            Ok(0)
         }
     }
 
@@ -443,5 +596,175 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("panicked"), "unexpected error: {msg}");
         assert!(msg.contains("kaboom"), "unexpected error: {msg}");
+    }
+
+    #[test]
+    fn classify_error_buckets_by_marker() {
+        // Connection-level wins even when an ambiguous word is also present.
+        assert_eq!(
+            classify_error(&anyhow::anyhow!(
+                "request failed: error sending request: connection refused"
+            )),
+            Retry::ConnLevel
+        );
+        assert_eq!(
+            classify_error(&anyhow::anyhow!("Home Assistant returned HTTP 503: down")),
+            Retry::Ambiguous
+        );
+        assert_eq!(
+            classify_error(&anyhow::anyhow!("operation timed out")),
+            Retry::Ambiguous
+        );
+        // Unknown / terminal errors are never retried.
+        assert_eq!(
+            classify_error(&anyhow::anyhow!("invalid arguments: bad json")),
+            Retry::No
+        );
+    }
+
+    /// A tool that fails its first `fail_times` calls (with `error_msg`) then
+    /// succeeds, counting every call. Lets a test assert how many attempts the
+    /// retry loop made.
+    struct FlakyTool {
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+        fail_times: usize,
+        error_msg: &'static str,
+        idempotent: bool,
+    }
+
+    #[async_trait]
+    impl Tool for FlakyTool {
+        fn name(&self) -> &'static str {
+            "flaky"
+        }
+        fn description(&self) -> &'static str {
+            "fails a few times then succeeds"
+        }
+        fn idempotent(&self) -> bool {
+            self.idempotent
+        }
+        async fn execute(&self, _input: String) -> anyhow::Result<String> {
+            let n = self.calls.fetch_add(1, Ordering::Relaxed);
+            if n < self.fail_times {
+                Err(anyhow::anyhow!("{}", self.error_msg))
+            } else {
+                Ok("ok".into())
+            }
+        }
+    }
+
+    fn flaky(
+        fail_times: usize,
+        error_msg: &'static str,
+        idempotent: bool,
+    ) -> (Arc<FlakyTool>, Arc<std::sync::atomic::AtomicUsize>) {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let tool = Arc::new(FlakyTool {
+            calls: calls.clone(),
+            fail_times,
+            error_msg,
+            idempotent,
+        });
+        (tool, calls)
+    }
+
+    // `start_paused` auto-advances the retry backoff sleeps, so these stay fast.
+
+    #[tokio::test(start_paused = true)]
+    async fn connection_error_is_retried_even_for_non_idempotent_tool() {
+        // The request never reached the server, so a side effect can't have
+        // landed — safe to retry regardless of idempotency.
+        let (tool, calls) = flaky(2, "connection refused", false);
+        let out = execute_isolated(tool, String::new()).await.unwrap();
+        assert_eq!(out, "ok");
+        assert_eq!(calls.load(Ordering::Relaxed), 3); // 2 failures + 1 success
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn terminal_error_is_not_retried() {
+        let (tool, calls) = flaky(usize::MAX, "invalid arguments: bad json", true);
+        let err = execute_isolated(tool, String::new()).await.unwrap_err();
+        assert!(err.to_string().contains("invalid arguments"));
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn ambiguous_error_is_retried_only_for_idempotent_tool() {
+        // Idempotent → retried.
+        let (tool, calls) = flaky(1, "operation timed out", true);
+        assert_eq!(execute_isolated(tool, String::new()).await.unwrap(), "ok");
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+
+        // Non-idempotent → a timeout might have applied server-side; don't retry.
+        let (tool, calls) = flaky(usize::MAX, "operation timed out", false);
+        let _ = execute_isolated(tool, String::new()).await;
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn retries_are_bounded_then_error_surfaces() {
+        let (tool, calls) = flaky(usize::MAX, "connection refused", false);
+        let err = execute_isolated(tool, String::new()).await.unwrap_err();
+        assert!(
+            err.to_string()
+                .to_lowercase()
+                .contains("connection refused")
+        );
+        assert_eq!(calls.load(Ordering::Relaxed), TOOL_RETRY_MAX_ATTEMPTS);
+    }
+
+    #[tokio::test]
+    async fn tool_call_budget_refuses_calls_past_the_cap() {
+        let repo = Arc::new(RecordingRuns {
+            steps: Mutex::new(Vec::new()),
+        });
+        let ctx = RunContext::new("run-budget".into(), repo.clone());
+        let (tool, calls) = flaky(0, "unused", false); // never fails; just counts
+        with_run(ctx, async {
+            // Calls up to the cap all execute.
+            for _ in 0..MAX_TOOL_CALLS_PER_TURN {
+                execute_isolated(tool.clone(), String::new()).await.unwrap();
+            }
+            // The next call is refused without ever reaching the tool.
+            let err = execute_isolated(tool.clone(), String::new())
+                .await
+                .unwrap_err();
+            assert!(err.to_string().contains("budget"), "got: {err}");
+        })
+        .await;
+
+        // The tool ran exactly cap times; the refused call never reached it.
+        assert_eq!(
+            calls.load(Ordering::Relaxed) as i64,
+            MAX_TOOL_CALLS_PER_TURN
+        );
+        // The refusal is still recorded as a failed step, for audit visibility.
+        let steps = repo.steps.lock().unwrap();
+        assert_eq!(steps.len() as i64, MAX_TOOL_CALLS_PER_TURN + 1);
+        assert!(!steps.last().unwrap().ok);
+        assert!(steps.last().unwrap().error.contains("budget"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn retry_collapses_into_a_single_ledger_step() {
+        let repo = Arc::new(RecordingRuns {
+            steps: Mutex::new(Vec::new()),
+        });
+        let ctx = RunContext::new("run-retry".into(), repo.clone());
+        let (tool, calls) = flaky(1, "connection refused", false);
+        with_run(ctx, async {
+            assert_eq!(execute_isolated(tool, String::new()).await.unwrap(), "ok");
+        })
+        .await;
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+
+        let steps = repo.steps.lock().unwrap();
+        assert_eq!(
+            steps.len(),
+            1,
+            "retries must record one step, not one per attempt"
+        );
+        assert!(steps[0].ok);
+        assert_eq!(steps[0].seq, 0);
     }
 }

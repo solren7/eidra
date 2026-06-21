@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 /// project, a person, or a decision. Memories are governed (status/confidence)
 /// and scoped (where they may surface) so the agent can be injected with a
 /// conservative profile (L1), recall relevant facts (L3), and let the user
-/// curate the full library (L2). See `docs/memory-injection-plan.md`.
+/// curate the full library (L2). See `docs/personal-agent-roadmap.md`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Memory {
     pub id: String,

@@ -10,7 +10,7 @@
 //! Schema is laid out **schema-first**: governance/scope/usage columns land all
 //! at once even before every consumer exists, because toasty's `push_schema`
 //! is not idempotent (a column change means deleting the file). See
-//! `docs/memory-injection-plan.md`.
+//! `docs/personal-agent-roadmap.md`.
 
 use std::path::Path;
 use std::sync::Arc;

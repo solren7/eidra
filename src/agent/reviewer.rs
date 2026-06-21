@@ -57,6 +57,23 @@ impl Reviewer for ReflectiveReviewer {
 
         let ctx = MemoryContext::from_session(&session.id);
         let mut outcome = ReviewOutcome::default();
+
+        // Anti-self-cannibalization (roadmap §5): collect the content keys of the
+        // active, in-scope memories — exactly the set eligible to be recalled
+        // into this session. A re-extraction whose content matches one of these
+        // is the assistant echoing its own injected context, not a fresh user
+        // disclosure, so it must not be re-ingested as a new candidate. Exact
+        // content-key match only; fuzzy/semantic dedup is deferred to embedding-
+        // based recall (§5-D).
+        let known_keys: std::collections::HashSet<String> = self
+            .memories
+            .list()
+            .await?
+            .into_iter()
+            .filter(|m| m.status == MemoryStatus::Active && ctx.allows(&m.scope))
+            .map(|m| memory_key(&m.content))
+            .collect();
+
         for suggestion in suggestions.memories {
             if should_skip(&suggestion.content) {
                 continue;
@@ -75,6 +92,11 @@ impl Reviewer for ReflectiveReviewer {
                 .await?
                 .is_some()
             {
+                continue;
+            }
+            // …or if shion already holds this fact as an active, in-scope memory
+            // (the self-cannibalization guard above).
+            if known_keys.contains(&key) {
                 continue;
             }
             let mut memory = Memory::new(kind, suggestion.content);
@@ -510,6 +532,62 @@ mod tests {
 
         // Same session + same fact → no duplicate on the second sweep.
         assert_eq!(memories.0.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn does_not_re_extract_a_known_active_memory() {
+        // shion already holds this fact as an active, in-scope memory — distilled
+        // from a *different* session, so the per-session source dedup can't catch
+        // it. The reviewer must still refuse to re-ingest it (the assistant likely
+        // echoed a recalled fact), instead of minting a duplicate candidate.
+        let reply = r#"{"memories":[{"kind":"fact","content":"shion uses Rust"}],"skills":[],"commitments":[]}"#;
+        let memories = Arc::new(FakeMemories::default());
+        let mut existing = Memory::new(MemoryKind::Fact, "shion uses Rust");
+        existing.status = MemoryStatus::Active;
+        existing.scope = crate::domain::memory::MemoryScope::Channel {
+            platform: "telegram".into(),
+            chat_id: "42".into(),
+        };
+        existing.source = "telegram:99".into(); // a different origin session
+        memories.save(&existing).await.unwrap();
+
+        let reviewer = ReflectiveReviewer::new(
+            Arc::new(FixedLlm(reply.to_string())),
+            memories.clone(),
+            Arc::new(FakeSkills::default()),
+            Arc::new(FakeTasks::default()),
+        );
+        let outcome = reviewer.review(&session("telegram:42")).await.unwrap();
+
+        assert!(outcome.memories_written.is_empty());
+        // Only the pre-existing memory remains; no duplicate candidate added.
+        assert_eq!(memories.0.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn re_extracts_known_memory_from_another_scope() {
+        // The same fact held active but scoped to a *different* channel was never
+        // eligible to be recalled into this session, so it is not self-echo — a
+        // channel-scoped candidate is still captured here.
+        let reply = r#"{"memories":[{"kind":"fact","content":"shion uses Rust"}],"skills":[],"commitments":[]}"#;
+        let memories = Arc::new(FakeMemories::default());
+        let mut existing = Memory::new(MemoryKind::Fact, "shion uses Rust");
+        existing.status = MemoryStatus::Active;
+        existing.scope = crate::domain::memory::MemoryScope::Channel {
+            platform: "feishu".into(),
+            chat_id: "oc_x".into(),
+        };
+        memories.save(&existing).await.unwrap();
+
+        let reviewer = ReflectiveReviewer::new(
+            Arc::new(FixedLlm(reply.to_string())),
+            memories.clone(),
+            Arc::new(FakeSkills::default()),
+            Arc::new(FakeTasks::default()),
+        );
+        reviewer.review(&session("telegram:42")).await.unwrap();
+
+        assert_eq!(memories.0.lock().unwrap().len(), 2);
     }
 
     #[test]

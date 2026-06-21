@@ -13,7 +13,7 @@ use crate::domain::{
     },
     reminder::{Reminder, ReminderRepository, ReminderStatus, parse_reminder_status},
     repository::{MessageRepository, SessionRepository, SkillRepository},
-    run::{Run, RunRepository, RunStep, parse_run_status},
+    run::{INTERRUPTED_ERROR, Run, RunRepository, RunStatus, RunStep, parse_run_status},
     session::Session,
     skill::Skill,
     todo::{SessionTodoRepository, TodoItem},
@@ -726,6 +726,54 @@ impl RunRepository for Db {
         steps.sort_by_key(|s| s.seq);
         Ok(steps)
     }
+
+    async fn prune(&self, cutoff: i64) -> anyhow::Result<usize> {
+        let mut db = self.inner.lock().await;
+        // Collect the ids to drop first, then delete those runs and any step
+        // whose `run_id` points at one of them.
+        let runs = toasty::query!(RunRecord).exec(&mut *db).await?;
+        let stale: std::collections::HashSet<String> = runs
+            .into_iter()
+            .filter(|r| r.started_at < cutoff)
+            .map(|r| r.id)
+            .collect();
+        if stale.is_empty() {
+            return Ok(0);
+        }
+        let steps = toasty::query!(RunStepRecord).exec(&mut *db).await?;
+        for step in steps {
+            if stale.contains(&step.run_id) {
+                step.delete().exec(&mut *db).await?;
+            }
+        }
+        let runs = toasty::query!(RunRecord).exec(&mut *db).await?;
+        for run in runs {
+            if stale.contains(&run.id) {
+                run.delete().exec(&mut *db).await?;
+            }
+        }
+        Ok(stale.len())
+    }
+
+    async fn reconcile_interrupted(&self, now: i64) -> anyhow::Result<usize> {
+        let mut db = self.inner.lock().await;
+        let running = RunStatus::Running.as_str();
+        let rows = toasty::query!(RunRecord).exec(&mut *db).await?;
+        let mut reconciled = 0;
+        for mut record in rows {
+            if record.status == running {
+                record
+                    .update()
+                    .status(RunStatus::Failed.as_str().to_string())
+                    .error(INTERRUPTED_ERROR.to_string())
+                    .ended_at(now)
+                    .exec(&mut *db)
+                    .await?;
+                reconciled += 1;
+            }
+        }
+        Ok(reconciled)
+    }
 }
 
 // ── helpers ───────────────────────────────────────────────────────────────────
@@ -887,6 +935,103 @@ mod tests {
         let recent = RunRepository::list(&db, 10).await.unwrap();
         assert_eq!(recent.len(), 1);
         assert_eq!(recent[0].id, run.id);
+    }
+
+    #[tokio::test]
+    async fn run_prune_drops_old_runs_and_their_steps() {
+        use crate::domain::run::{Run, RunStatus, RunStep};
+        let db = Db::connect(&sqlite_url("shion_run_prune_test.db"))
+            .await
+            .unwrap();
+
+        // Three runs at increasing start times, each with one step.
+        let make = |id: &str, started_at: i64| Run {
+            id: id.to_string(),
+            session_id: "cli:s".to_string(),
+            input: "x".to_string(),
+            plan: String::new(),
+            status: RunStatus::Done,
+            final_output: String::new(),
+            error: String::new(),
+            started_at,
+            ended_at: Some(started_at + 1),
+        };
+        for (id, t) in [("run-a", 100), ("run-b", 200), ("run-c", 300)] {
+            let run = make(id, t);
+            RunRepository::start(&db, &run).await.unwrap();
+            RunRepository::append_step(
+                &db,
+                &RunStep {
+                    run_id: id.to_string(),
+                    seq: 0,
+                    tool_name: "time".into(),
+                    args: "{}".into(),
+                    result: "ok".into(),
+                    error: String::new(),
+                    ok: true,
+                    started_at: t,
+                    ended_at: t + 1,
+                },
+            )
+            .await
+            .unwrap();
+        }
+
+        // Cutoff drops run-a (100) and run-b (200), keeps run-c (300).
+        let removed = RunRepository::prune(&db, 250).await.unwrap();
+        assert_eq!(removed, 2);
+
+        let remaining = RunRepository::list(&db, 10).await.unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].id, "run-c");
+        // Steps of pruned runs are gone; the survivor's step stays.
+        assert!(RunRepository::steps(&db, "run-a").await.unwrap().is_empty());
+        assert_eq!(RunRepository::steps(&db, "run-c").await.unwrap().len(), 1);
+
+        // Nothing older than the floor → no-op.
+        assert_eq!(RunRepository::prune(&db, 0).await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn reconcile_interrupted_fails_only_running_runs() {
+        use crate::domain::run::{INTERRUPTED_ERROR, Run, RunStatus};
+        let db = Db::connect(&sqlite_url("shion_run_reconcile_test.db"))
+            .await
+            .unwrap();
+
+        // A run left mid-flight (status stays `Running`, as on a crash).
+        let stuck = Run::start("cli:crashed", "long task");
+        RunRepository::start(&db, &stuck).await.unwrap();
+
+        // A run that finished cleanly before the restart — must be untouched.
+        let mut done = Run::start("cli:ok", "quick task");
+        done.status = RunStatus::Done;
+        done.final_output = "reply".into();
+        done.ended_at = Some(500);
+        RunRepository::start(&db, &done).await.unwrap();
+        RunRepository::finish(&db, &done).await.unwrap();
+
+        let reconciled = RunRepository::reconcile_interrupted(&db, 1234)
+            .await
+            .unwrap();
+        assert_eq!(reconciled, 1);
+
+        let stuck = RunRepository::get(&db, &stuck.id).await.unwrap().unwrap();
+        assert_eq!(stuck.status, RunStatus::Failed);
+        assert_eq!(stuck.error, INTERRUPTED_ERROR);
+        assert_eq!(stuck.ended_at, Some(1234));
+
+        let done = RunRepository::get(&db, &done.id).await.unwrap().unwrap();
+        assert_eq!(done.status, RunStatus::Done);
+        assert_eq!(done.final_output, "reply");
+
+        // Idempotent: a second pass finds nothing still running.
+        assert_eq!(
+            RunRepository::reconcile_interrupted(&db, 9999)
+                .await
+                .unwrap(),
+            0
+        );
     }
 
     #[tokio::test]

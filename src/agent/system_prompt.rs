@@ -29,7 +29,7 @@ use crate::domain::memory::{Memory, ScoredMemory};
 
 /// Character budget for the L1 pinned-memory block (whole block, not per
 /// memory). Deliberately small — pinned is a conservative identity/preference
-/// profile, not the memory library. See `docs/memory-injection-plan.md`.
+/// profile, not the memory library. See `docs/personal-agent-roadmap.md`.
 pub const PINNED_MEMORY_BUDGET: usize = 800;
 
 /// Stable markers wrapping an injected memory block, so a future reviewer that
@@ -81,7 +81,7 @@ pub fn render_pinned_memory_block(pinned: &[Memory]) -> Option<String> {
 /// Character budget for the L3 recalled-memory block (whole block, not per
 /// memory). Larger than the pinned budget — recalled facts are query-relevant
 /// and more directly useful to the answer — but still bounded. See
-/// `docs/memory-injection-plan.md`.
+/// `docs/personal-agent-roadmap.md`.
 pub const RECALLED_MEMORY_BUDGET: usize = 2_000;
 
 /// Stable markers wrapping the L3 recall block (anti-self-amplification, same

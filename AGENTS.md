@@ -25,11 +25,18 @@ shion memory search <query>        # substring search across all memories
 shion memory promote <id>          # candidate → active+confirmed
 shion memory reject <id>           # candidate → rejected
 shion memory pin <id>              # pin into the L1 per-turn profile (manual-only path)
+shion memory report                # quality report: status/confidence counts + piles needing triage
 
 shion run list [--limit N]         # recent runs (one per turn), newest first
 shion run inspect <id>             # one run in full: input, plan, outcome, every tool step
+shion run prune --before <date>|--keep <N>   # trim the run ledger (delete old runs + their steps)
+
+shion skill list                   # registered skills (name, protected flag, description)
+shion doctor                       # config & gateway health: model+key, schedules, channels, home, recent failures
 
 shion wechat login                 # provision WeChat iLink creds by scanning a QR (run on the host)
+
+shion workday [YYYY-MM-DD]          # is a date a Chinese working day? (statutory holidays + 调休); defaults to today
 ```
 
 Logs: a `tracing` subscriber is installed in `main.rs` (`init_tracing`) — without
@@ -61,7 +68,8 @@ Building requires `protoc` (`brew install protobuf`): the feishu channel's webso
 frames are protobuf, and `lark-websocket-protobuf` compiles its `.proto` at build time.
 
 Runtime settings (provider/model/base_url/aux_model, maintenance `schedule`,
-the opt-in daily `briefing_schedule`, the `[channels.*]` tables) live in
+the opt-in daily `briefing_schedule` + its `briefing_workdays_only` gate, the
+`[channels.*]` tables) live in
 `~/.shion/config.toml`; credentials (API keys,
 `FEISHU_APP_ID` / `FEISHU_APP_SECRET`, `TELEGRAM_BOT_TOKEN`, `HASS_TOKEN`) only
 in `~/.shion/.env`. Priority: built-in defaults < config.toml < `SHION_*` env
@@ -221,7 +229,7 @@ kanban.db connections), and two cross-cutting files at the top level —
 - `todo` tool: call with no args to read; pass `todos` to replace the whole list (full-list replace, no merge). Reads the current session from the ambient turn context (`current_session`); inert (no session) for aux sub-agents and sweeps
 - the turn's session context is established for BOTH paths: the gateway dispatcher sets it (with a real `ReplySink`), and `AgentRuntime::handle_input` sets a *detached* context (no-op sink) when none exists, so the REPL gets `todo` too — see `SessionContext::detached`
 
-`domain/memory.rs` + `tools/memory.rs` + `infra/memory/memory_db.rs` — long-term memory as three surfaces (roadmap §6/§1; design in `docs/memory-injection-plan.md`)
+`domain/memory.rs` + `tools/memory.rs` + `infra/memory/memory_db.rs` — long-term memory as three surfaces (roadmap §5)
 - `Memory` model is governed and scoped: `kind` (profile/preference/feedback/project/person/fact/decision/reference), `status` (candidate→active, plus archived/rejected), `confidence` (extracted/inferred/confirmed/user_written), `importance`, `pinned`, `scope` (`MemoryScope` global/project/channel/session, serialized as `scope_type`+`scope_key`), `source`/`source_message_id`, timestamps, `expires_at`/`last_used_at`. `MemoryContext::from_session` derives the turn's `allowed_scopes` from the session id (chat → global+channel+session; CLI → global+session, **never** infers project from chat)
 - **L1 pinned** (done): `MemoryRepository::pinned(ctx)` filters `is_pinnable` (pinned + active + confirmed/user_written + identity-kind + in-scope); `system_prompt::render_pinned_memory_block` renders an ≤800-char block injected in `infra/llm.rs::complete` **after** the volatile tier (cache-stable), marked `<!-- shion:memory:pinned -->`, flagged as untrusted data. Main agent only (`build_llm(..., Some(repo))`); aux/delegate get `None`
 - **L2 tool/governance** (done): `memory` tool `save/search/list/update/promote/reject/archive`; `search` is scope-bounded (`MemoryQuery` + `rerank_score`: lexical `LIKE` + importance/confidence/recency, no embedding). Operator CLI `shion memory list/search/promote/reject/pin`. `pin` is the manual-only path into L1 — automated extraction never pins
@@ -246,6 +254,7 @@ kanban.db connections), and two cross-cutting files at the top level —
 - `ReminderSweep` delivers due reminders via `Notifier` every minute (10-min grace window; older ones are marked `missed`)
 - `TaskSweep` notifies once when an open task comes due (the task stays open; `due_notified_at` is the at-most-once guard)
 - `BriefingSweep` is the opt-in daily briefing (roadmap §4): it reads open tasks + recently-learned memories, lets the aux LLM compose a short digest (`briefing_prompt` is the pure, clock-injected prompt builder — returns `None` when there's nothing worth a ping), and delivers it through the same `Notifier`. Only scheduled when `briefing_schedule` is set (no default — proactive pings stay opt-in); wired in `cli/gateway.rs`.
+- `WorkdayGated` (also `agent/daemon.rs`) is a `Maintenance` decorator that gates any sweep to Chinese **working days** — the "上班才执行" gate. cron still picks the time slot; the gate decides whether today counts as a workday at all (statutory holiday → skip, ordinary weekend → skip, 调休 makeup weekend → run). Lookups go through `domain::workday::WorkdayCalendar`, degrading to a Monday–Friday default (`is_weekday`) on any data outage so a real workday never gets blocked. Opt-in via `briefing_workdays_only` (config.toml / `SHION_BRIEFING_WORKDAYS_ONLY`); when on, `cli/gateway.rs` wraps the briefing sweep. Calendar impl is `infra/workday.rs::HolidayCalendar`: it fetches one year at a time from a free holiday API (`api.jiejiariapi.com`, `date → isOffDay`) and caches each year to `~/.shion/workdays/{year}.json` — fetched the first time any date in a year is queried, then reused (a yearly refresh, no extra cron). `shion workday [date]` is the operator probe (also primes the cache).
 - `supervise` is the loop: sleep to the next cron fire, run the cycle, isolate per-cycle failures, and trip a circuit breaker after 5 consecutive failures
 - the OS-level supervisor install is `cli/service.rs` (`shion gateway start/stop/restart/status`, macOS launchd: `KeepAlive` auto-restart + `RunAtLoad`)
 

@@ -41,6 +41,11 @@ impl Tool for WebFetchTool {
         "Fetch a web page by URL and return its readable text content."
     }
 
+    /// Read-only GET: safe to retry on an ambiguous transient failure.
+    fn idempotent(&self) -> bool {
+        true
+    }
+
     fn parameters_schema(&self) -> serde_json::Value {
         json!({
             "type": "object",

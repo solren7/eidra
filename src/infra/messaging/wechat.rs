@@ -133,10 +133,10 @@ impl WeChatLogin for WeChatQrLogin {
                 match render_qr_png(content) {
                     Ok(png) => {
                         tokio::spawn(async move {
-                            if let Err(error) = sink.send_photo(png, "用微信扫码登录 shion").await {
-                                let _ = sink
-                                    .send(&format!("二维码已生成但发送失败：{error}"))
-                                    .await;
+                            if let Err(error) = sink.send_photo(png, "用微信扫码登录 shion").await
+                            {
+                                let _ =
+                                    sink.send(&format!("二维码已生成但发送失败：{error}")).await;
                             }
                         });
                     }

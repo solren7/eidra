@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 /// Risk level of an action, used to decide how prominently to warn the user.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Risk {
@@ -6,6 +8,26 @@ pub enum Risk {
     Safe,
     Normal,
     Dangerous,
+}
+
+/// A structured, machine-matchable description of the action being approved.
+///
+/// Distinct from [`ApprovalRequest::summary`] (which is for humans) and
+/// [`ApprovalRequest::scope_key`] (a coarse "remember this kind" cache key):
+/// `ActionRef` carries the *resource* — the command, path, URL, or service — so
+/// the configurable permission policy (`domain::policy`) can match on directory
+/// prefixes, command prefixes, and domains rather than parsing the summary
+/// string. Optional: a request without one degrades to risk/scope-only matching.
+#[derive(Debug, Clone)]
+pub enum ActionRef {
+    /// A shell command (`shell` tool). Matched against the full command line.
+    Shell { command: String },
+    /// A filesystem access (`file` tool). Matched against the path.
+    File { path: PathBuf, write: bool },
+    /// An outbound network fetch (`web_fetch`). Matched against the URL's host.
+    Network { url: String },
+    /// A Home Assistant service call, matched as `domain.service`.
+    Service { domain: String, service: String },
 }
 
 /// A request for the user to approve a side-effecting action.
@@ -19,6 +41,8 @@ pub struct ApprovalRequest {
     /// pattern, or `file:write`). An approver can cache an "allow for this
     /// session" answer under this key so repeats don't prompt again.
     pub scope_key: Option<String>,
+    /// Structured resource the permission policy matches on (see [`ActionRef`]).
+    pub action: Option<ActionRef>,
 }
 
 impl ApprovalRequest {
@@ -28,6 +52,7 @@ impl ApprovalRequest {
             risk: Risk::Safe,
             detail: None,
             scope_key: None,
+            action: None,
         }
     }
 
@@ -37,6 +62,7 @@ impl ApprovalRequest {
             risk: Risk::Normal,
             detail: None,
             scope_key: None,
+            action: None,
         }
     }
 
@@ -46,12 +72,19 @@ impl ApprovalRequest {
             risk: Risk::Dangerous,
             detail: Some(detail.into()),
             scope_key: None,
+            action: None,
         }
     }
 
     /// Attach a session-scope key (see [`ApprovalRequest::scope_key`]).
     pub fn with_scope_key(mut self, key: impl Into<String>) -> Self {
         self.scope_key = Some(key.into());
+        self
+    }
+
+    /// Attach the structured resource the policy matches on (see [`ActionRef`]).
+    pub fn with_action(mut self, action: ActionRef) -> Self {
+        self.action = Some(action);
         self
     }
 }

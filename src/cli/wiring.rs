@@ -58,6 +58,16 @@ pub async fn build(
     // `execute_isolated`). Resolved like every other setting; first call wins,
     // which is fine — chat and gateway each build once.
     crate::services::tool_registry::set_tool_result_cap(model_config.max_tool_result_bytes);
+
+    // Wrap the interactive approver in the configurable permission policy
+    // (roadmap §3): the policy auto-allows / hard-denies per `[policy]` rules and
+    // only escalates to `approver` when it says "ask". With no `[policy]` table
+    // this is the empty policy — identical to the bare interactive approver.
+    let approver = crate::agent::policy_approver::PolicyApprover::wrap(
+        crate::config::policy_config(),
+        approver,
+    );
+
     // File operations are confined to the current working directory.
     let workspace = Arc::new(Workspace::current_dir()?);
 

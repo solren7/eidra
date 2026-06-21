@@ -3,7 +3,10 @@ use std::sync::Arc;
 
 use crate::{
     agent::{
-        daemon::{BriefingSweep, Maintenance, ReminderSweep, ReviewSweep, Schedule, TaskSweep},
+        daemon::{
+            BriefingSweep, Maintenance, ReminderSweep, ReviewSweep, Schedule, TaskSweep,
+            WorkdayGated,
+        },
         gateway::{Gateway, MaintenanceService},
         interaction::{ApprovalState, ChatApprover, GatewayDispatcher},
     },
@@ -12,15 +15,18 @@ use crate::{
         approval::Approver,
         gateway::{MessageHandler, WeChatLogin},
         home::HomeRepository,
+        memory::MemoryRepository,
         notify::Notifier,
         pairing::PairingRepository,
         reminder::ReminderRepository,
-        repository::SessionRepository,
+        repository::{MessageRepository, SessionRepository},
+        run::RunRepository,
         task::TaskRepository,
         todo::SessionTodoRepository,
     },
     infra::{
         messaging::{
+            api::ApiChannel,
             feishu::{FeishuChannel, FeishuSender},
             home_notifier::{HomeNotifier, TextSender},
             homeassistant::HomeAssistantChannel,
@@ -29,6 +35,7 @@ use crate::{
             wechat::{WeChatChannel, WeChatQrLogin, WeChatSender, build_bot},
         },
         persistence::{db::Db, kanban::KanbanDb},
+        workday::HolidayCalendar,
     },
 };
 
@@ -44,6 +51,15 @@ pub async fn run(db_url: &str, kanban_url: &str, schedule_expr: &str) -> anyhow:
     let briefing_schedule = briefing_expr.as_deref().map(Schedule::parse).transpose()?;
 
     let db = Arc::new(Db::connect(db_url).await?);
+    // Reconcile runs left `Running` by a crashed earlier process (launchd
+    // restarts the gateway): flip them to failed/"interrupted" so the ledger is
+    // truthful. Best-effort — a reconciliation failure must not block startup.
+    let now = time::OffsetDateTime::now_utc().unix_timestamp();
+    match RunRepository::reconcile_interrupted(&*db, now).await {
+        Ok(0) => {}
+        Ok(n) => tracing::info!(count = n, "reconciled interrupted runs on startup"),
+        Err(error) => tracing::warn!(%error, "failed to reconcile interrupted runs"),
+    }
     // Durable tasks in their own file, separate from disposable session state.
     let kanban = Arc::new(KanbanDb::connect(kanban_url).await?);
 
@@ -77,6 +93,9 @@ pub async fn run(db_url: &str, kanban_url: &str, schedule_expr: &str) -> anyhow:
     // channel's poll loop populates the context-token map the sender reads.
     let wechat = crate::config::wechat_config()?;
     let wechat_cred_path = crate::config::wechat_cred_path();
+    // HTTP API channel (OpenAI-compatible + dashboard). Resolved early so a
+    // missing API_SERVER_KEY fails at startup, not on first request.
+    let api = crate::config::api_config()?;
     let wechat_bot = wechat.as_ref().map(|_| build_bot(&wechat_cred_path));
     let wechat_sender = wechat_bot
         .as_ref()
@@ -127,7 +146,7 @@ pub async fn run(db_url: &str, kanban_url: &str, schedule_expr: &str) -> anyhow:
     let notifier: Arc<dyn Notifier> = Arc::new(HomeNotifier::new(
         senders,
         home_repo.clone(),
-        config_home,
+        config_home.clone(),
         Arc::new(MacosNotifier),
     ));
 
@@ -146,7 +165,7 @@ pub async fn run(db_url: &str, kanban_url: &str, schedule_expr: &str) -> anyhow:
     let sessions: Arc<dyn SessionRepository> = db.clone();
     let todos: Arc<dyn SessionTodoRepository> = db.clone();
     let dispatcher = Arc::new(GatewayDispatcher::new(
-        handler,
+        handler.clone(),
         approvals,
         sessions,
         home_repo,
@@ -171,12 +190,22 @@ pub async fn run(db_url: &str, kanban_url: &str, schedule_expr: &str) -> anyhow:
     // Reads tasks + memories, composes on the aux LLM, delivers via the same
     // home notifier as reminders.
     if let Some(schedule) = briefing_schedule {
-        let briefing_sweep: Arc<dyn Maintenance> = Arc::new(BriefingSweep {
+        let mut briefing_sweep: Arc<dyn Maintenance> = Arc::new(BriefingSweep {
             tasks: kanban.clone(),
             memories: wired.memories.clone(),
             llm: wired.aux_llm.clone(),
             notifier: notifier.clone(),
         });
+        // Opt-in: only fire on Chinese working days (statutory holidays and
+        // 调休-adjusted weekends respected). The calendar is built only when
+        // gating is on, so the holiday API is never touched otherwise.
+        if crate::config::briefing_workdays_only() {
+            let calendar = Arc::new(HolidayCalendar::new(crate::config::workday_cache_dir()));
+            briefing_sweep = Arc::new(WorkdayGated {
+                inner: briefing_sweep,
+                calendar,
+            });
+        }
         gateway = gateway.with_maintenance(MaintenanceService {
             schedule,
             maintenance: briefing_sweep,
@@ -224,6 +253,33 @@ pub async fn run(db_url: &str, kanban_url: &str, schedule_expr: &str) -> anyhow:
     if let Some(cfg) = &ha_channel {
         gateway = gateway.add_channel(Box::new(HomeAssistantChannel::new(cfg)));
         channels.push("homeassistant");
+    }
+
+    // HTTP API channel: serves the local dashboard UI and any OpenAI-compatible
+    // client. It calls the handler directly (synchronous request/response), so
+    // it needs the repositories rather than just the dispatcher. Added last so
+    // `/api/status` can report every other channel that came up.
+    if let Some(cfg) = &api {
+        let enabled = {
+            let mut names: Vec<String> = channels.iter().map(|s| s.to_string()).collect();
+            names.push("api".to_string());
+            names
+        };
+        let messages: Arc<dyn MessageRepository> = db.clone();
+        let runs: Arc<dyn RunRepository> = db.clone();
+        let memories: Arc<dyn MemoryRepository> = wired.memories.clone();
+        gateway = gateway.add_channel(Box::new(ApiChannel::new(
+            cfg,
+            handler.clone(),
+            db.clone(),
+            messages,
+            kanban.clone(),
+            memories,
+            runs,
+            enabled,
+            config_home.clone(),
+        )));
+        channels.push("api");
     }
 
     // Send the offline notice on shutdown only when a chat channel exists; with

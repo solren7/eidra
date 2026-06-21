@@ -325,6 +325,29 @@ impl Maintenance for BriefingSweep {
     }
 }
 
+/// Wraps a `Maintenance` so it only runs on Chinese working days: a holiday or
+/// an ordinary weekend skips the inner sweep, while a 调休 makeup workday runs
+/// it. This is the "上班才执行" gate — the cron decides *when* a slot fires;
+/// the calendar decides whether today counts as a workday at all. Calendar
+/// lookups degrade to Monday–Friday, so a data outage never blocks a real
+/// workday's run.
+pub struct WorkdayGated {
+    pub inner: Arc<dyn Maintenance>,
+    pub calendar: Arc<dyn crate::domain::workday::WorkdayCalendar>,
+}
+
+#[async_trait]
+impl Maintenance for WorkdayGated {
+    async fn run(&self) -> anyhow::Result<MaintenanceSummary> {
+        let today = chrono::Local::now().date_naive();
+        if !self.calendar.is_workday(today).await {
+            info!(date = %today, "not a workday; skipping gated maintenance");
+            return Ok(MaintenanceSummary::default());
+        }
+        self.inner.run().await
+    }
+}
+
 /// Render a unix timestamp in local time at minute precision for the digest.
 fn briefing_local_time(unix: i64) -> String {
     chrono::DateTime::from_timestamp(unix, 0)
@@ -1000,5 +1023,60 @@ mod tests {
         let summary = sweep.run().await.unwrap();
         assert_eq!(summary.briefings_sent, 0);
         assert!(notifier.calls.lock().unwrap().is_empty());
+    }
+
+    // ── WorkdayGated ──────────────────────────────────────────────────────────
+
+    /// Counts how many times the inner sweep actually ran.
+    #[derive(Default)]
+    struct CountingMaintenance(Mutex<usize>);
+
+    #[async_trait]
+    impl Maintenance for CountingMaintenance {
+        async fn run(&self) -> anyhow::Result<MaintenanceSummary> {
+            *self.0.lock().unwrap() += 1;
+            Ok(MaintenanceSummary {
+                briefings_sent: 1,
+                ..Default::default()
+            })
+        }
+    }
+
+    /// A calendar with a hard-wired verdict — no network, no disk.
+    struct FixedCalendar(bool);
+
+    #[async_trait]
+    impl crate::domain::workday::WorkdayCalendar for FixedCalendar {
+        async fn is_workday(&self, _date: chrono::NaiveDate) -> bool {
+            self.0
+        }
+    }
+
+    #[tokio::test]
+    async fn workday_gate_runs_inner_on_a_workday() {
+        let inner = Arc::new(CountingMaintenance::default());
+        let gate = WorkdayGated {
+            inner: inner.clone(),
+            calendar: Arc::new(FixedCalendar(true)),
+        };
+        let summary = gate.run().await.unwrap();
+        assert_eq!(summary.briefings_sent, 1);
+        assert_eq!(*inner.0.lock().unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn workday_gate_skips_inner_off_a_workday() {
+        let inner = Arc::new(CountingMaintenance::default());
+        let gate = WorkdayGated {
+            inner: inner.clone(),
+            calendar: Arc::new(FixedCalendar(false)),
+        };
+        let summary = gate.run().await.unwrap();
+        assert_eq!(summary, MaintenanceSummary::default());
+        assert_eq!(
+            *inner.0.lock().unwrap(),
+            0,
+            "inner must not run off a workday"
+        );
     }
 }

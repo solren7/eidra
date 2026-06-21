@@ -32,7 +32,7 @@ use crate::{
 pub type PreambleFn = Arc<dyn Fn() -> String + Send + Sync>;
 
 /// Max facts pulled per turn by L3 active recall. Small on purpose: recall is
-/// background context, top-ranked relevance only. See `docs/memory-injection-plan.md`.
+/// background context, top-ranked relevance only. See `docs/personal-agent-roadmap.md`.
 const RECALL_LIMIT: usize = 5;
 
 /// Generic [`LlmClient`] over any `rig` completion model. The concrete provider

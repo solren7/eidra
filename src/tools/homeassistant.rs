@@ -5,7 +5,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::domain::{
-    approval::{ApprovalRequest, Approver},
+    approval::{ActionRef, ApprovalRequest, Approver},
     tool::Tool,
 };
 
@@ -49,6 +49,15 @@ struct HassArgs {
     /// {"brightness_pct": 50}).
     #[serde(default)]
     data: Option<Value>,
+    /// Automation config id (the `id` field, e.g. "1718900000000") for
+    /// get_automation / save_automation / delete_automation. This is *not* the
+    /// `automation.*` entity id — `list_automations` surfaces both.
+    #[serde(default)]
+    id: Option<String>,
+    /// The automation config object for save_automation (alias / trigger /
+    /// condition / action / mode).
+    #[serde(default)]
+    config: Option<Value>,
 }
 
 /// Talks to a Home Assistant instance over its REST API: read entity states,
@@ -108,7 +117,15 @@ impl Tool for HomeAssistantTool {
          to learn what `call_service` accepts); \
          action=\"call_service\" invokes a service to change something (requires \
          `domain` + `service`, e.g. light/turn_on, usually with `entity_id`, \
-         plus optional `data`). Control actions ask for approval."
+         plus optional `data`). \
+         To edit automations: action=\"list_automations\" lists each automation's \
+         entity id, on/off state, name, and config `id`; \
+         action=\"get_automation\" returns one automation's full config (requires \
+         `id`); action=\"save_automation\" creates or updates one (requires `id` + \
+         a `config` object with at least `trigger` and `action`; pass the whole \
+         config — it replaces the automation); action=\"delete_automation\" removes \
+         one (requires `id`). Control and automation-edit actions ask for approval; \
+         saving/deleting an automation persists to automations.yaml and reloads HA."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -117,7 +134,8 @@ impl Tool for HomeAssistantTool {
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": ["list_entities", "get_state", "list_services", "call_service"],
+                    "enum": ["list_entities", "get_state", "list_services", "call_service",
+                             "list_automations", "get_automation", "save_automation", "delete_automation"],
                     "description": "The operation to perform."
                 },
                 "domain": {
@@ -139,6 +157,14 @@ impl Tool for HomeAssistantTool {
                 "data": {
                     "type": "object",
                     "description": "Extra service data for call_service, e.g. {\"brightness_pct\": 50}."
+                },
+                "id": {
+                    "type": "string",
+                    "description": "Automation config id for get/save/delete_automation (e.g. \"1718900000000\" or a slug). NOT the automation.* entity id; list_automations shows both."
+                },
+                "config": {
+                    "type": "object",
+                    "description": "Automation config for save_automation: an object with `alias`, `trigger`, optional `condition`, `action`, and `mode`. Pass the complete config — save replaces the whole automation."
                 }
             },
             "required": ["action"]
@@ -240,7 +266,11 @@ impl Tool for HomeAssistantTool {
                     .unwrap_or_default();
                 let request =
                     ApprovalRequest::normal(format!("Home Assistant: {domain}.{service}{target}"))
-                        .with_scope_key(format!("homeassistant:{domain}.{service}"));
+                        .with_scope_key(format!("homeassistant:{domain}.{service}"))
+                        .with_action(ActionRef::Service {
+                            domain: domain.to_string(),
+                            service: service.to_string(),
+                        });
                 if !self.approver.approve(&request).await {
                     return Ok("Service call rejected by user; nothing was changed.".to_string());
                 }
@@ -269,8 +299,122 @@ impl Tool for HomeAssistantTool {
                 ))
             }
 
+            "list_automations" => {
+                let states = self.get_json("/api/states").await?;
+                let mut out = format_automations(&states);
+                truncate_to_char_boundary(&mut out, MAX_BYTES);
+                Ok(out)
+            }
+
+            "get_automation" => {
+                let id = require_automation_id(&args.id)?;
+                let cfg = self
+                    .get_json(&format!("/api/config/automation/config/{id}"))
+                    .await?;
+                let mut out =
+                    serde_json::to_string_pretty(&cfg).unwrap_or_else(|_| cfg.to_string());
+                truncate_to_char_boundary(&mut out, MAX_BYTES);
+                Ok(out)
+            }
+
+            "save_automation" => {
+                let id = require_automation_id(&args.id)?;
+                let config = match args.config {
+                    Some(c @ Value::Object(_)) => c,
+                    Some(_) => anyhow::bail!("`config` must be a JSON object"),
+                    None => anyhow::bail!("`config` is required for action=save_automation"),
+                };
+
+                // Same hardline floor as call_service: an automation can invoke
+                // services too, so writing one that calls `shell_command` /
+                // `python_script` / etc. would smuggle arbitrary code execution
+                // past the call_service blocklist. Refuse before any write — no
+                // approval unlocks it.
+                if let Some(bad) = blocked_service_in(&config) {
+                    return Ok(format!(
+                        "Refused: automation calls blocked service domain `{bad}` \
+                         (arbitrary code execution / SSRF on the HA host). Blocked: {}.",
+                        BLOCKED_DOMAINS.join(", ")
+                    ));
+                }
+
+                let name = config
+                    .get("alias")
+                    .and_then(Value::as_str)
+                    .map(|a| format!(" \"{a}\""))
+                    .unwrap_or_default();
+                let request =
+                    ApprovalRequest::normal(format!("Home Assistant: save automation {id}{name}"))
+                        .with_scope_key("homeassistant:automation.save".to_string())
+                        .with_action(ActionRef::Service {
+                            domain: "automation".to_string(),
+                            service: "save".to_string(),
+                        });
+                if !self.approver.approve(&request).await {
+                    return Ok("Automation save rejected by user; nothing was changed.".to_string());
+                }
+
+                let resp = self
+                    .client
+                    .post(format!(
+                        "{}/api/config/automation/config/{id}",
+                        self.base_url
+                    ))
+                    .bearer_auth(&self.token)
+                    .json(&config)
+                    .send()
+                    .await
+                    .map_err(|e| anyhow::anyhow!("request to Home Assistant failed: {e}"))?;
+                let status = resp.status();
+                let text = resp.text().await.unwrap_or_default();
+                if !status.is_success() {
+                    anyhow::bail!("Home Assistant returned HTTP {status}: {text}");
+                }
+                Ok(format!(
+                    "Saved automation {id}{name}; HA reloaded automations."
+                ))
+            }
+
+            "delete_automation" => {
+                let id = require_automation_id(&args.id)?;
+                // Deleting an automation is irreversible (its YAML block is gone):
+                // gate it as Dangerous so the approver warns prominently.
+                let request = ApprovalRequest::dangerous(
+                    format!("Home Assistant: delete automation {id}"),
+                    "The automation's config is permanently removed from automations.yaml."
+                        .to_string(),
+                )
+                .with_scope_key("homeassistant:automation.delete".to_string())
+                .with_action(ActionRef::Service {
+                    domain: "automation".to_string(),
+                    service: "delete".to_string(),
+                });
+                if !self.approver.approve(&request).await {
+                    return Ok(
+                        "Automation delete rejected by user; nothing was changed.".to_string()
+                    );
+                }
+
+                let resp = self
+                    .client
+                    .delete(format!(
+                        "{}/api/config/automation/config/{id}",
+                        self.base_url
+                    ))
+                    .bearer_auth(&self.token)
+                    .send()
+                    .await
+                    .map_err(|e| anyhow::anyhow!("request to Home Assistant failed: {e}"))?;
+                let status = resp.status();
+                let text = resp.text().await.unwrap_or_default();
+                if !status.is_success() {
+                    anyhow::bail!("Home Assistant returned HTTP {status}: {text}");
+                }
+                Ok(format!("Deleted automation {id}; HA reloaded automations."))
+            }
+
             other => Err(anyhow::anyhow!(
-                "unknown action `{other}` (expected list_entities/get_state/list_services/call_service)"
+                "unknown action `{other}` (expected list_entities/get_state/list_services/call_service/list_automations/get_automation/save_automation/delete_automation)"
             )),
         }
     }
@@ -303,6 +447,86 @@ fn valid_entity_id(s: &str) -> bool {
         .chars()
         .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_');
     domain_ok && object_ok
+}
+
+/// Require the `id` arg for automation actions and validate its shape: the id
+/// is interpolated into `/api/config/automation/config/{id}`, so only
+/// `[A-Za-z0-9_-]` is allowed — no dots or slashes that could traverse to
+/// another endpoint. HA's generated ids are digit strings; hand-written slugs
+/// add letters/underscores/hyphens.
+fn require_automation_id(id: &Option<String>) -> anyhow::Result<String> {
+    let id = id
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("`id` is required for this automation action"))?;
+    if id.is_empty()
+        || !id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    {
+        anyhow::bail!("invalid automation id `{id}` (expected [A-Za-z0-9_-])");
+    }
+    Ok(id.to_string())
+}
+
+/// Walk an automation config for any service call whose domain is on the
+/// hardline `BLOCKED_DOMAINS` list. HA names service calls under a `service`
+/// key (or the newer `action` key) as a `"domain.name"` string; we check those
+/// values only, so a benign `alias` mentioning a domain name won't trip the
+/// floor. Returns the offending domain if found.
+fn blocked_service_in(config: &Value) -> Option<&'static str> {
+    match config {
+        Value::Object(map) => {
+            for (key, val) in map {
+                if (key == "service" || key == "action")
+                    && let Some(s) = val.as_str()
+                    && let Some((domain, _)) = s.split_once('.')
+                    && let Some(blocked) = BLOCKED_DOMAINS.iter().find(|d| **d == domain)
+                {
+                    return Some(blocked);
+                }
+                if let Some(hit) = blocked_service_in(val) {
+                    return Some(hit);
+                }
+            }
+            None
+        }
+        Value::Array(arr) => arr.iter().find_map(blocked_service_in),
+        _ => None,
+    }
+}
+
+/// Render `/api/states` into one line per automation:
+/// `automation.foo = on (Friendly Name) [id=123]`, sorted.
+fn format_automations(states: &Value) -> String {
+    let Some(arr) = states.as_array() else {
+        return "Unexpected response from Home Assistant.".to_string();
+    };
+    let mut lines: Vec<String> = arr
+        .iter()
+        .filter_map(|s| {
+            let entity_id = s.get("entity_id").and_then(Value::as_str)?;
+            if !entity_id.starts_with("automation.") {
+                return None;
+            }
+            let attrs = s.get("attributes");
+            let name = attrs
+                .and_then(|a| a.get("friendly_name"))
+                .and_then(Value::as_str);
+            let cfg_id = attrs.and_then(|a| a.get("id")).and_then(Value::as_str);
+            let state = s.get("state").and_then(Value::as_str).unwrap_or("unknown");
+            let name_part = name.map(|n| format!(" ({n})")).unwrap_or_default();
+            let id_part = cfg_id
+                .map(|i| format!(" [id={i}]"))
+                .unwrap_or_else(|| " [id=?]".to_string());
+            Some(format!("{entity_id} = {state}{name_part}{id_part}"))
+        })
+        .collect();
+    lines.sort();
+    if lines.is_empty() {
+        "No automations found.".to_string()
+    } else {
+        lines.join("\n")
+    }
 }
 
 /// Render `/api/states` (a JSON array) into sorted `entity_id = state (name)`
@@ -564,5 +788,126 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("unknown action"));
+    }
+
+    // ── automation editing ────────────────────────────────────────────────
+
+    fn automation_states() -> Value {
+        json!([
+            {"entity_id": "automation.morning", "state": "on",
+             "attributes": {"friendly_name": "Morning Routine", "id": "1700000000001"}},
+            {"entity_id": "automation.away", "state": "off",
+             "attributes": {"friendly_name": "Away Mode", "id": "1700000000002"}},
+            {"entity_id": "light.kitchen", "state": "on", "attributes": {}}
+        ])
+    }
+
+    #[test]
+    fn require_automation_id_validates_shape() {
+        assert_eq!(
+            require_automation_id(&Some("1700000000001".into())).unwrap(),
+            "1700000000001"
+        );
+        assert_eq!(
+            require_automation_id(&Some("porch_light-2".into())).unwrap(),
+            "porch_light-2"
+        );
+        assert!(require_automation_id(&None).is_err());
+        assert!(require_automation_id(&Some("".into())).is_err());
+        assert!(require_automation_id(&Some("../secrets".into())).is_err()); // traversal
+        assert!(require_automation_id(&Some("a/b".into())).is_err()); // slash
+        assert!(require_automation_id(&Some("a.b".into())).is_err()); // dot
+    }
+
+    #[test]
+    fn format_automations_lists_only_automations_with_id() {
+        let out = format_automations(&automation_states());
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines.len(), 2);
+        assert_eq!(
+            lines[0],
+            "automation.away = off (Away Mode) [id=1700000000002]"
+        );
+        assert_eq!(
+            lines[1],
+            "automation.morning = on (Morning Routine) [id=1700000000001]"
+        );
+        assert!(!out.contains("light.kitchen"));
+    }
+
+    #[test]
+    fn blocked_service_in_catches_nested_blocked_call() {
+        let cfg = json!({
+            "alias": "evil",
+            "trigger": [{"platform": "state", "entity_id": "binary_sensor.x"}],
+            "action": [
+                {"service": "light.turn_on", "target": {"entity_id": "light.a"}},
+                {"service": "shell_command.rm_rf"}
+            ]
+        });
+        assert_eq!(blocked_service_in(&cfg), Some("shell_command"));
+    }
+
+    #[test]
+    fn blocked_service_in_catches_newer_action_key() {
+        let cfg = json!({"action": [{"action": "python_script.exec"}]});
+        assert_eq!(blocked_service_in(&cfg), Some("python_script"));
+    }
+
+    #[test]
+    fn blocked_service_in_allows_clean_config_and_ignores_alias_text() {
+        let cfg = json!({
+            "alias": "talk about shell_command.run in text",
+            "trigger": [{"platform": "sun", "event": "sunset"}],
+            "action": [{"service": "light.turn_on", "target": {"entity_id": "light.porch"}}]
+        });
+        assert_eq!(blocked_service_in(&cfg), None);
+    }
+
+    #[tokio::test]
+    async fn save_automation_blocked_service_refused_even_when_approved() {
+        let out = tool(Arc::new(AllowAll))
+            .execute(
+                json!({"action": "save_automation", "id": "1", "config": {
+                    "action": [{"service": "command_line.run"}]}})
+                .to_string(),
+            )
+            .await
+            .unwrap();
+        assert!(out.contains("blocked service domain"));
+    }
+
+    #[tokio::test]
+    async fn save_automation_rejected_when_approval_denied() {
+        let out = tool(Arc::new(DenyAll))
+            .execute(
+                json!({"action": "save_automation", "id": "1", "config": {
+                    "alias": "ok", "action": [{"service": "light.turn_on"}]}})
+                .to_string(),
+            )
+            .await
+            .unwrap();
+        assert!(out.contains("rejected by user"));
+    }
+
+    #[tokio::test]
+    async fn delete_automation_rejected_when_approval_denied() {
+        let out = tool(Arc::new(DenyAll))
+            .execute(json!({"action": "delete_automation", "id": "1"}).to_string())
+            .await
+            .unwrap();
+        assert!(out.contains("rejected by user"));
+    }
+
+    #[tokio::test]
+    async fn save_automation_invalid_id_errors() {
+        let err = tool(Arc::new(AllowAll))
+            .execute(
+                json!({"action": "save_automation", "id": "../x", "config": {"action": []}})
+                    .to_string(),
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("invalid automation id"));
     }
 }

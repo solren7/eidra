@@ -20,6 +20,11 @@ use async_trait::async_trait;
 pub const RUN_FIELD_CAP: usize = 4000;
 pub const STEP_FIELD_CAP: usize = 2000;
 
+/// Error stamped on a run reconciled at startup. A run left in `Running` is the
+/// residue of a process that died mid-turn (a run is `Running` only while in
+/// flight), so on the next start it is flipped to `Failed` with this reason.
+pub const INTERRUPTED_ERROR: &str = "interrupted (process restarted)";
+
 /// Truncate `s` to at most `cap` chars (char-boundary safe), appending an
 /// ellipsis marker when cut so the reader knows the row is not the whole story.
 pub fn truncate(s: &str, cap: usize) -> String {
@@ -136,6 +141,18 @@ pub trait RunRepository: Send + Sync {
     async fn get(&self, id: &str) -> anyhow::Result<Option<Run>>;
     /// Steps for a run, ordered by `seq`.
     async fn steps(&self, run_id: &str) -> anyhow::Result<Vec<RunStep>>;
+    /// Delete every run started before `cutoff` (unix seconds) and its steps.
+    /// Returns the number of runs removed. The ledger accumulates like messages,
+    /// so this is the operator's manual prune (roadmap §9) — no automatic policy.
+    async fn prune(&self, cutoff: i64) -> anyhow::Result<usize>;
+
+    /// Flip every run still `Running` to `Failed`/[`INTERRUPTED_ERROR`], stamping
+    /// `ended_at = now`; return how many were reconciled. Called once at process
+    /// startup: a run is `Running` only while in flight, so any left over is the
+    /// residue of a crashed earlier process — leaving it would make `run list`
+    /// lie. Also the first building block toward resume (§6): it names the set of
+    /// interrupted runs a future `resume` could pick up.
+    async fn reconcile_interrupted(&self, now: i64) -> anyhow::Result<usize>;
 }
 
 #[cfg(test)]

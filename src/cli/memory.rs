@@ -91,6 +91,103 @@ pub async fn pin(url: &str, id: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Memory quality report (roadmap §9): bucket the whole library by status and
+/// confidence, then surface the piles that need attention — candidates awaiting
+/// triage, the pinned L1 set, low-confidence actives, long-unused actives, and
+/// expired memories. Read-only; suggests `promote`/`reject`/`archive`/`pin`.
+///
+/// Note: there is no recall-count signal yet (only `last_used_at`), so "high
+/// frequency hits" can't be reported — "long unused" is the recency proxy.
+pub async fn report(url: &str) -> anyhow::Result<()> {
+    let db = store(url).await?;
+    let memories = db.list().await?;
+    if memories.is_empty() {
+        println!("(no memories)");
+        return Ok(());
+    }
+    let now = time::OffsetDateTime::now_utc().unix_timestamp();
+    let total = memories.len();
+
+    // Counts by status, in lifecycle order.
+    println!("total: {total}");
+    println!("\nby status:");
+    for status in [
+        MemoryStatus::Candidate,
+        MemoryStatus::Active,
+        MemoryStatus::Archived,
+        MemoryStatus::Rejected,
+    ] {
+        let n = memories.iter().filter(|m| m.status == status).count();
+        if n > 0 {
+            println!("  {:<10} {n}", status.as_str());
+        }
+    }
+
+    println!("\nby confidence:");
+    for confidence in [
+        MemoryConfidence::UserWritten,
+        MemoryConfidence::Confirmed,
+        MemoryConfidence::Inferred,
+        MemoryConfidence::Extracted,
+    ] {
+        let n = memories
+            .iter()
+            .filter(|m| m.confidence == confidence)
+            .count();
+        if n > 0 {
+            println!("  {:<12} {n}", confidence.as_str());
+        }
+    }
+
+    // The piles that need an operator's eye.
+    let active = |m: &&Memory| m.status == MemoryStatus::Active;
+    let candidates: Vec<_> = memories
+        .iter()
+        .filter(|m| m.status == MemoryStatus::Candidate)
+        .collect();
+    let pinned: Vec<_> = memories.iter().filter(|m| m.pinned).collect();
+    let low_conf: Vec<_> = memories
+        .iter()
+        .filter(active)
+        .filter(|m| {
+            matches!(
+                m.confidence,
+                MemoryConfidence::Extracted | MemoryConfidence::Inferred
+            )
+        })
+        .collect();
+    // Active but never surfaced, or not surfaced in 90+ days — archival candidates.
+    const STALE_SECS: i64 = 90 * 24 * 60 * 60;
+    let mut unused: Vec<_> = memories
+        .iter()
+        .filter(active)
+        .filter(|m| m.last_used_at.is_none_or(|t| now - t > STALE_SECS))
+        .collect();
+    let expired: Vec<_> = memories.iter().filter(|m| m.is_expired(now)).collect();
+
+    report_bucket("candidates awaiting triage (→ promote/reject)", &candidates);
+    report_bucket("pinned into L1 profile", &pinned);
+    report_bucket("low-confidence active (extracted/inferred)", &low_conf);
+    unused.sort_by_key(|m| m.last_used_at.unwrap_or(0));
+    report_bucket("active, long unused (90d+ → consider archive)", &unused);
+    report_bucket("expired (past expires_at)", &expired);
+    Ok(())
+}
+
+/// Print a named bucket: a header with the count, then up to 10 sample lines.
+fn report_bucket(label: &str, items: &[&Memory]) {
+    if items.is_empty() {
+        return;
+    }
+    println!("\n{label}: {}", items.len());
+    for m in items.iter().take(10) {
+        println!("  {}", line(m));
+    }
+    if items.len() > 10 {
+        println!("  … and {} more", items.len() - 10);
+    }
+}
+
 async fn mutate(url: &str, id: &str, apply: impl FnOnce(&mut Memory)) -> anyhow::Result<()> {
     let db = store(url).await?;
     let mut memory = db

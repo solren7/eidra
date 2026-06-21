@@ -1,4 +1,5 @@
 //! Messaging infra: ingress channels, outbound senders, and proactive notifiers.
+pub mod api;
 pub mod feishu;
 pub mod home_notifier;
 pub mod homeassistant;

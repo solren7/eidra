@@ -33,3 +33,10 @@ wechatbot = "=0.3.2"
 qrcode = { version = "0.14.1", default-features = false }
 # PNG only — render the wechat login QR for delivery over chat (no image codecs we don't need).
 image = { version = "0.25", default-features = false, features = ["png"] }
+# HTTP API channel: OpenAI-compatible + dashboard endpoints over a loopback port.
+axum = "0.8"
+
+[dev-dependencies]
+# `test-util` (not part of tokio's `full`) enables `#[tokio::test(start_paused)]`,
+# which auto-advances virtual time so retry-backoff tests don't sleep for real.
+tokio = { version = "1.52.0", features = ["full", "test-util"] }

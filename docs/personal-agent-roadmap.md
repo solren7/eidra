@@ -1,100 +1,65 @@
 # 个人 Agent 能力缺口与路线图
 
-本文档基于当前 shion 的实现状态，整理一个个人 agent 工具从"能聊天和调用工具"走向"能长期辅助个人事务"的能力缺口。
+本文档基于当前 shion 的实现状态，整理它从"能聊天和调用工具"继续走向"能长期辅助个人事务"还差什么。重点不是复述已落地能力，而是把下一阶段的产品/工程缺口排清楚。
 
 ## 现状
 
-被动应答这条链路已经成型：
+被动应答、常驻入口、任务/记忆/审计这几条主链路已经成型：
 
-- `AgentRuntime` 负责会话生命周期、消息持久化、planner 决策和回复写回
-- LLM 通过 `rig` 接入，完整多轮对话历史已经发给模型（`infra/llm.rs`），并暴露内置工具给模型调用
-- 已注册的工具包括 `time`、`file`、`shell`、`web_fetch`、`web_search`、`session`、`reminder`、`memory`、`delegate`、`skill`
-- `reminder` 支持一次性和 cron 周期提醒，由 gateway 每分钟投递（macOS 通知）
-- `gateway` 已经具备常驻进程（launchd 安装）、维护任务调度和非交互审批策略
-- ingress channel 已落地两个：feishu（ws 长连接）和 telegram（长轮询），均带 `allow_from` 准入和 `home_chat` 提醒投递
-- 反思 reviewer、markdown memory、skill registry 已经具备初步自学习闭环
-- 已有基础 inspect：`shion cron list`、`shion session list/clean`
+- `AgentRuntime` 负责会话生命周期、消息持久化、run ledger 开关和回复写回。
+- LLM 通过 `rig` 接入，完整多轮历史会送入模型，工具调用循环目前仍由 rig 的 agent loop 驱动。
+- 已注册工具包括 `time`、`file`、`shell`、`web_fetch`、`web_search`、`session`、`reminder`、`memory`、`delegate`、`skill`、`task`、`todo`、`homeassistant`。
+- `reminder` 支持一次性提醒和 5 字段 cron 周期提醒，由 gateway 每分钟扫描投递。
+- `gateway` 已具备常驻进程、launchd 安装、维护任务调度、chat 交互式审批和 proactive home channel。
+- ingress channel 已落地：Feishu、Telegram、WeChat、Home Assistant 事件通道；聊天通道带 pairing / allowlist，HA 是受 `HASS_TOKEN` 保护的本地事件入口。
+- durable task 存在独立 `~/.shion/kanban.db`；long-term memory 存在独立 `~/.shion/memory.db`；session/message/run/todo 等 disposable 状态仍在 `~/.shion/shion.db`。
+- reflective reviewer 已能提取 candidate memories 和 commitments；承诺会进入 task inbox。
+- memory 已有 L1 pinned profile、L2 governance tool、L3 active recall。
+- run ledger 已记录每个 turn 和每次工具调用，CLI 可 `shion run list/inspect`。
+- 已有 operator CLI：`cron`、`session`、`task`、`run`、`memory`、`pair`、`model`、`wechat`、`workday`、`logs`。
 
-总体判断：**缺的不是再补一个零散工具，而是"主动协作"的闭环**——shion 能在用户发起对话时干活，但还不能在用户不开终端的时候帮上忙。主动性闭环 = 入口（消息能递进来）+ 任务模型（知道该做什么）+ 后台权限（能安全地做事）。
+总体判断：**shion 已经不是单纯聊天工具，下一阶段缺的是更完整的主动协作闭环**。入口、任务、记忆和审计已经有骨架；价值瓶颈转移到了真实个人上下文、执行控制、权限策略产品化，以及可恢复的长任务。
 
-## 1. 真实的 ingress 入口（已基本闭合）
+## 1. 真实个人数据连接器
 
-`Channel` trait（`agent/gateway.rs`）已有两个实现：feishu（`infra/feishu.rs`，ws 长连接）和 telegram（`infra/telegram.rs`，getUpdates 长轮询），消息随时可以递进 gateway，"打开终端聊天"已经变成"随时把一个事件交给 shion"。
+个人 agent 的价值来自真实上下文。当前 shion 有聊天入口和 Home Assistant，但还缺工作/生活数据源的只读连接器。
 
-剩余可选项（按需再做）：
+优先级最高的是 **飞书日历只读连接器**，因为它能直接提升 briefing 和日常协作质量：
 
-1. 本地 unix socket channel：方便脚本、快捷指令、Raycast、Automator 调用
-2. 剪贴板 / share sheet 风格入口，支持快速丢一段文本给 shion
+- 今天/本周日程
+- 会议冲突
+- 空闲时间
+- 即将开始的会议提醒
+- 会后待办/纪要入口
 
-## 2. 任务与承诺模型
+下一批连接器按价值排序：
 
-当前唯一的事务性模型是 reminder，它只解决"到点通知"，回答不了"我现在该做什么""哪些事情卡住了""我答应过谁什么"。
+- 飞书邮件：未读、待回复、重要线程
+- 飞书任务或外部任务系统：同步已有任务，而不是让 shion 另起孤岛
+- Notion / Obsidian / 本地 markdown：检索长期笔记
+- 浏览器当前页：总结、保存、转任务
+- 本地文件夹：最近文件、下载目录、项目目录
 
-hermes-agent 把"任务"拆成了三层，各管各的：会话内 todo（极简 content/status，只管 agent 当前焦点）、cron（无状态定时自动化，shion 的 reminder/Maintenance 已对应）、kanban（SQLite 持久任务队列，跨会话）。本节做的是 kanban 那一层——**跨会话的持久任务存储**（已落地）；会话内的焦点 todo 现已单独落地为 `domain/todo.rs` + `todo` 工具（见第 8 节），与持久 `task` 严格分开。
+原则：每个连接器先只读，再做写入；写入必须经过第 3 节的权限策略。
 
-借鉴 hermes 后对原方案的具体修正：
+## 2. 主动摘要升级
 
-**一张表，不是四个模型。** 原方案的 `Task` / `InboxItem` / `Commitment` / `Project` 收敛为单一 `Task`——hermes kanban 用一个 `triage` 状态就覆盖了 inbox 概念，承诺也只是带"对象"的任务，不值得单独建模：
+每日 briefing 已落地：`BriefingSweep` 读取 open tasks + 近期记忆，用 aux LLM 组织成摘要，经 `HomeNotifier` 投递；它是 opt-in 的，只有设置 `briefing_schedule` 才运行，也可通过 `briefing_workdays_only` 限制为中国工作日。
 
-- `id` / `title` / `note`
-- `status`：`inbox`（未归类，取代 InboxItem）→ `todo` → `done`，外加 `waiting`（卡在别人/外部，对应 hermes 的 `blocked`）和 `cancelled`
-- `waiting_on`：可空，这件事在等谁 / 承诺给了谁——这就是 Commitment
-- `due_at`：可空
-- `source`：来源会话 id（`telegram:{chat_id}` / `feishu:{chat_id}` / cli）——借鉴 hermes cron job 的 `origin` 字段，让到期提醒和 briefing 能投递回任务来源的渠道
-- `source_message_id`：可空，自动提取时的去重键（hermes 的 `idempotency_key` 思路）
-- `created_at` / `completed_at`
+当前缺口：
 
-持久任务存在**独立的 `~/.shion/kanban.db`**（`infra/kanban.rs` 的 `KanbanDb`），与会话/消息所在的 `shion.db` 分开——后者是可随手删除的 dev 状态、且 toasty schema 变更要靠删库重建，kanban 是真实个人数据不能被这种重置波及。session todo（会话内、可丢弃）留在 `shion.db`。
+- briefing 还没有接日历，所以无法包含今天会议、空闲时间、会议冲突。
+- briefing 还没有接邮件/外部任务，因此无法提醒待回复线程和外部系统里的待办。
+- 每周摘要尚未实现，但框架已经够用：换 prompt、换 cron、读取完成任务和近期 run/memory 即可。
 
-刻意不加的字段（hermes 的取舍验证过）：数值优先级（hermes todo 完全靠列表顺序表达优先级，够用）。**Project → `board` 字符串字段已落地**（`domain/task.rs` 的 `Task.board`，空串=默认 board）：`task` 工具 capture/update 可带 `board`，list 可按 board 过滤，`shion task list` 以 `#board` 展示——多项目分组而不建 Project 实体，正是 hermes kanban 的做法。
-
-**刻意不做依赖图与 owner。** 调研过 hermes kanban（`task_links` 的 parent/child 边、`claim_lock`/`worker_pid`/`task_runs` 等）和 Claude Code 的 Task\* 工具（`blockedBy`/`blocks` 双向同步 + `owner`=agent id）后确认：那两套都是为**自主多 worker 编排 / multi-agent swarm** 服务的（hermes 的 kanban 工具对普通 chat 默认不可见，只给 dispatcher spawn 的 worker 用）。shion 是单 turn 个人助理，没有 dispatcher、没有 worker 群，加 `blockedBy`/`blocks`/`owner` 只会是没有消费者的死结构（与 §6 "无消费者不加字段" 同一原则）。个人语境下 "这事卡在谁身上" 由 `waiting_on` 字符串覆盖。
-
-**工具收敛为 `task`，砍掉 `plan_today`。**
-
-- `capture`：一句话快速收集，默认进 `inbox`
-- `list`：按状态过滤
-- `update`：改状态、截止时间、`waiting_on`
-- `complete`：完成任务
-
-`plan_today` 不做成结构化工具——hermes 的 daily briefing 就是一个 cron job 的 prompt（"读任务列表，组织今日建议"），不是接口。shion 的对应物是第 4 节的 briefing sweep：模型在 briefing 里自己读 task list 自己组织，避免提前固化"今日计划"的输出格式。
-
-**承诺提取复用 reflective reviewer。**（✅ 已实现）hermes 没有显式承诺跟踪（todo/cron/kanban 三者都不管"我答应过谁什么"，这是它明确的 gap），但它的 background review 证明了"每轮对话后用副 agent 提取结构化信息"这条路。shion 已有同样的基础设施（reviewer + ReviewSweep），加一个提取方向即可：扫描会话中"我答应 / 需要跟进 / 等对方回复"类内容，capture 成 `inbox` 任务，带 `source_message_id` 去重。自动提取**只进 inbox、不直接进 todo**，由用户确认或丢弃——和第 6 节"防止 reviewer 污染记忆库"是同一个治理原则。
-
-实现要点：`ReflectiveReviewer`（`agent/reviewer.rs`）的产出 JSON 增加 `commitments` 数组（title/waiting_on/note），review 末尾把每条承诺存成 `inbox` 任务，`source` 记来源会话 id，`source_message_id` 是对规范化标题做的 FNV-1a 去重键（`TaskRepository::find_by_source_message_id` 跨全部状态查重，已 triage/完成/取消的承诺不会被重复抓取）。`ReviewOutcome.tasks_captured` 和 `MaintenanceSummary.tasks_captured` 把计数透出到 sweep 日志。
-
-**到期投递走现有基建。** 带 `due_at` 的任务由一个 TaskSweep 投递（照抄 ReminderSweep：每分钟、10 分钟宽限窗口、at-most-once），目标优先任务的 `source` 渠道，回退 `home_chat` / macOS 通知。不引入新的调度机制。
-
-这是最能把 shion 从聊天工具推进到个人 agent 的能力。
-
-## 3. 后台权限策略（不只是 DenyApprover）
-
-gateway 目前挂的是 `DenyApprover`：任何有副作用的工具一律拒绝。这在 v0.1 是对的，但它和"主动 agent"直接冲突——daily briefing 要读日历、整理 inbox 要写文件，全都会被挡掉。不解决这个，gateway 永远只能做扫描和提醒。
-
-需要把权限从"交互式确认 vs 全拒"升级为显式可配置策略：
-
-- `shell` 默认只读，写操作需要确认
-- 特定目录允许自动读写
-- 特定命令前缀允许自动执行
-- 网络访问可按域名授权
-- gateway 模式默认拒绝危险动作，但允许配置放行的安全动作
-- 工具写入动作必须记录到 run ledger（见第 7 节）
-
-权限策略应该是产品能力，不只是内部实现细节。`src/policy/` 目录已创建，可以作为落点。
-
-## 4. 每日 / 每周主动摘要（每日已落地）
-
-maintenance 框架（`Schedule` + `Maintenance` trait）是现成的，加一个 briefing sweep 成本很低。但它的价值取决于第 2 节的任务模型和第 5 节的日历数据——没有这些，briefing 只能说"你没有到期提醒"。所以顺序上放在任务模型之后。
-
-**已实现：每日 briefing。** `BriefingSweep`（`agent/daemon.rs`）读取 open tasks + 近 7 天新增的记忆，用 aux LLM 组织成一段简短摘要，走现有 `Notifier`（channel `home_chat` 优先，回退 macOS）投递。纯函数 `briefing_prompt` 负责拼 prompt 并在"无事可报"时返回 `None`（不发空摘要）。**opt-in**：只有在 config.toml / `SHION_BRIEFING_SCHEDULE` 设了 `briefing_schedule` cron 才调度，没有默认时间——主动推送不能不请自来，也不硬编码 cron。日程（第 5 节日历）尚缺，每周摘要尚未做（同一框架换 prompt + cron 即可）。
-
-每日摘要建议包含：
+每日摘要最终应包含：
 
 - 今天日程
 - 到期任务
 - 未关闭承诺
 - 最近新增重要记忆
-- 需要用户确认的事项
+- 待确认的 memory / task candidate
+- 邮件或消息里的待回复事项
 
 每周摘要建议包含：
 
@@ -102,116 +67,163 @@ maintenance 框架（`Schedule` + `Maintenance` trait）是现成的，加一个
 - 卡住的项目
 - 被多次推迟的任务
 - 新形成的偏好或工作流规则
-- 建议清理的过期记忆
+- 建议清理的过期/低置信记忆
 
-这类主动摘要会让 shion 更像一个长期协作者，而不是被动问答工具。
+## 3. 权限策略产品化
 
-## 5. 个人数据连接器（飞书优先）
+目前已有两层基础：
 
-个人 agent 的价值来自它能接触真实个人上下文。对当前用户而言，第一个连接器几乎肯定是飞书：日历、待办、邮件都在那里，且可以和 Lark ingress channel 共享鉴权。
+- CLI 场景用 `CliApprover` 交互确认。
+- gateway 场景用 `ChatApprover`，`Risk::Safe` 自动放行，`Risk::Normal` / `Risk::Dangerous` 通过聊天 `/approve`、`/approve session`、`/deny` 决策。
 
-按使用频率逐步补：
+这已经替代了早期的一刀切 `DenyApprover`，但还不是完整产品能力。下一步应该把权限从"临时审批"升级为可配置策略：
 
-- 日历：今天/本周日程、会议冲突、空闲时间
-- 邮件：未读、待回复、重要线程
-- 任务系统：如果用户已有外部任务工具，先同步而不是替代
-- 笔记：Obsidian / Notion / 本地 markdown 检索
-- 浏览器当前页：总结、保存、转任务
-- 本地文件夹：最近文件、下载目录、项目目录
+- 特定目录允许自动读写。
+- 特定命令前缀允许自动执行。
+- 网络访问按域名授权。
+- gateway 模式默认拒绝危险动作，但允许用户配置放行的安全动作。
+- 不同 channel / session 可以有不同权限。
+- 所有写入动作和外部副作用必须进入 run ledger。
 
-每个连接器都先做只读，再做写入；写入必须经过第 3 节的权限策略。
+落点可以是独立 policy 层，而不是散在各工具里的 if/else。
 
-## 6. 长期记忆检索与治理（来源 + 过期已落地）
+## 4. 任务与承诺模型
 
-当前已有 markdown memory 和 reflective reviewer，但缺分类、来源追溯和过期机制。reviewer 自动写记忆的情况下，没有治理机制会慢慢污染记忆库。重要，但记忆量还小的时候问题不显，紧迫性低于前几节。
+这块已经基本落地，但仍有少量产品缺口。
 
-**已实现：来源追溯 + 过期。** `Memory` 加了两个有实际消费者的治理字段（`domain/memory.rs`）：`source`（来源 session id，reviewer 写记忆时自动打上，`memory` 工具列表里展示出来供回答时追溯"为什么这么认为"）和 `expiry`（可空 TTL；`MdMemoryStore::list` 在读取时过滤掉过期记忆，文件保留在盘上不删，剪枝是另一个独立动作）。`memory` 工具的 `save` 多了 `expiry_days` 参数让 agent 能给记忆设时效。分类（`kind`）此前已有。`confidence` / `updated_at` 暂缓——没有消费者前是死字段。下面列的 `fact/preference/...` 六分类是更细的方向，尚未做。
+已实现：
 
-建议至少区分以下类别：
+- durable `Task` 单表：`inbox` / `todo` / `waiting` / `done` / `cancelled`。
+- `waiting_on` 覆盖个人语境里的承诺/等待关系。
+- `board` 字符串覆盖轻量项目分组，不建 Project 实体。
+- `task` tool 支持 capture/list/update/complete。
+- `TaskSweep` 每分钟投递到期任务，at-most-once。
+- reflective reviewer 会从会话中提取 commitments，自动进入 inbox，用户再 triage。
+- session-scoped `todo` tool 已落地，用于当前会话的工作焦点列表。
 
-- `fact`：关于用户、环境、项目的事实
-- `preference`：用户偏好、输出格式、工作方式
-- `project`：长期项目背景和当前状态
-- `person`：人物、团队、协作关系
-- `decision`：已经做出的决策及原因
-- `open_loop`：尚未关闭的问题、承诺、等待事项
+刻意不做：
 
-每条记忆最好带上：
+- task dependency graph
+- owner / worker claim
+- multi-agent swarm 调度字段
 
-- source session id / message id
-- created_at / updated_at
-- confidence
-- optional expiry
+原因仍然成立：shion 是单 turn 个人助理，没有 worker 群；这些结构暂时没有消费者。
 
-这样可以减少 agent 自己污染记忆，也能在回答时追溯"为什么这么认为"。
+剩余缺口：
 
-## 7. 工作流执行记录（run ledger）（记录已落地，resume 待做）
+- 更好的 task triage 操作体验，例如批量 promote/reject/board 分类。
+- task 来源投递更细化：从哪个 channel 来，最好回哪个 channel。
+- 与外部任务系统同步。
 
-长任务需要可恢复、可审计。
+## 5. 长期记忆召回与治理
 
-**已实现：记录层。** `domain/run.rs` 的 `Run` / `RunStep` 模型 + `RunRepository`（impl 在 `infra/db.rs`，存 `shion.db`——执行态绑定 session，和 messages 一样可丢弃，非持久个人数据）：
+memory 三层已经落地：
 
-- 一次 turn = 一条 `Run`（用户原始请求 `input`、planner 决策摘要 `plan`、`status` running/done/failed、`final_output`、`error`、起止时间）
-- 每次工具调用 = 一条 `RunStep`（`tool_name`、`args`、`result`、`error`、`ok`、`seq`、时间）
-- **埋点在 `execute_isolated`**（`services/tool_registry.rs`）——这是 LLM function-calling 与 keyword 路由两条路径唯一的汇聚点，所以账本能捕获**全部**工具调用，而不只是 runtime 显式路由的那几次。`runtime.rs::run_turn` 用一个 `RunContext` task-local + `run` tracing span 包住 turn 主体
-- 所有账本写入 **best-effort**（warn 记录，绝不拖垮 turn 或 tool），对齐 memory `mark_used` 的契约
-- **脱敏**：step `args` 默认全存，但每个 `Tool` 可经 `Tool::redact_args` 自行脱敏——`shell` 擦掉疑似密钥、`file` 丢掉写入正文；`result` 仅截断不脱敏（shell 输出仍可能含密钥，接受，shion.db 本地可删）。字段按 `RUN_FIELD_CAP`/`STEP_FIELD_CAP` 截断
-- aux 子 agent 与 maintenance sweep 没有 `RunContext`，其工具调用不进账本
-- 顺带补上了**全局 tracing subscriber**（`main.rs::init_tracing`）：此前全代码库的 `info!`/`warn!`/`debug!` 因无 subscriber 全是空操作；现在写 stderr（gateway 由 launchd 落到 `~/.shion/logs/gateway.err.log`），`SHION_LOG` 控制级别，默认 `info,toasty=warn`
-- operator 视图：`shion run list [--limit N]` / `shion run inspect <id>`
+- L1 pinned profile：手动 pin、active、confirmed/user_written、scope 过滤后注入。
+- L2 memory tool/governance：save/search/list/update/promote/reject/archive/pin。
+- L3 active recall：基于用户当前输入做 token-overlap recall，注入 top memories，并记录 `last_used_at`。
 
-**尚未做：** `resume` 上一次中断任务，以及与之配套的 `recoverable` 字段（roadmap §6「无消费者不加字段」，等 resume 真要做时再加）；账本剪枝（runs 像 messages 一样累积，后续可挂一个 operator 清理动作）。第 3 节的权限审计将复用本账本。
+下一步是质量升级，而不是再加一个粗糙入口：
 
-## 8. 更强的 planner / orchestrator
+- aux recall agent：从候选 hits 中选择、压缩、解释相关 facts。
+- embedding / hybrid search：作为召回信号，不能绕过 scope/status/expiry/confidence 过滤。
+- usage-based promote/archive 建议：基于 recall count、不同 query 数、不同天数、平均分、last_used_at 等信号生成待确认建议。
+- reviewer 防自噬规则继续保持：不能从注入块再提取记忆。
 
-当前 planner 仍然是很薄的一层，主要依赖 LLM tool calling。下一步应该让 shion 自己拥有更明确的执行策略。
+治理原则不变：自动提取只能进 candidate，不能自动 pin；影响长期行为的内容必须可追溯、可拒绝、可归档。
 
-**已落地：会话内焦点 todo。** `domain/todo.rs` + `todo` 工具是"多步计划"的第一块——模型把复杂请求拆成有序步骤、单 in_progress、完成即标记，用户（尤其在 telegram/feishu 上）能看到进度。形状取 hermes `todo_tool` 与 Claude Code `TodoWrite` 的精简交集（`{content, status, active_form}`、整列替换写入）。shion 不做上下文压缩，所以不需要 hermes 那种"压缩后重注入"，工具返回值留在历史里即可；按 session 持久化（`SessionTodoRecord`）只是因为 shion 每 turn 重载 session，`/new` 时清空。工具靠 `current_session()` 拿当前会话；REPL 经 `SessionContext::detached` 也能用。剩下的 planner 能力（澄清、重试、预算、中途产物）仍未做。
+## 6. 工作流执行记录与恢复
 
-建议支持：
+run ledger 的记录层已经落地：
 
-- 澄清问题：信息不足时先问，而不是盲目执行
-- 多步计划：把复杂请求拆成步骤
-- 工具失败重试：可重试错误和不可重试错误分开处理
-- 预算限制：限制时间、token、工具调用次数
-- 危险动作审批：结合现有 `Approver` 做更细粒度策略
-- 中途产物保存：长任务可以先落地草稿或 run record
+- 一次 turn = 一条 `Run`。
+- 每次工具调用 = 一条 `RunStep`。
+- 埋点在 `services/tool_registry.rs::execute_isolated`，覆盖 LLM function-calling 路径。
+- step args 可由工具自行 redaction；`shell` 会擦掉疑似密钥，`file` 会丢掉写入正文。
+- `shion run list [--limit N]` / `shion run inspect <id>` 可查看。
 
-不需要一开始做复杂模型化 planner，但至少要把"一次请求一次回复"升级为"一个有状态执行单元"。
+尚未做：
 
-**架构前提（2026-06 决定）：** 多步工具循环目前完全在 rig 的 agent loop（`infra/llm.rs` 的 `agent.prompt().max_turns()`）里，shion 看不见也控制不了中间步。上面这些能力（澄清/重试分类/预算/中途产物）都需要 shion 自己驱动这个循环——即把循环从 rig 收回 `AgentRuntime`，rig 只做单次 completion。这是个有回归风险的核心重写，**刻意推迟**：在没有任何一个上述功能做消费者时先收回循环，只会逐字复刻 rig 行为、徒增耦合与风险（同 §6「无消费者不加结构」）。正确做法是等某个具体控制点（首选"工具瞬时错误自动重试"或"token/次数预算上限"）真正要做时，由它的需求驱动着把循环收回来——那时循环的形状才有依据。曾评估过的"vestigial planner"（`KeywordPlanner`/`Plan`/`MultiStep`）已于同期删除，避免一个既不真编排又不让开的空壳抽象。
+- `resume` 上一次中断任务。
+- 与 resume 配套的 `recoverable` 字段。
+- run ledger 剪枝策略。
+- 基于 run ledger 的权限审计视图。
+
+`recoverable` 不应提前加成死字段。等真正做 resume 时，再由消费者驱动模型变化。
+
+## 7. 更强的 planner / orchestrator
+
+当前多步工具循环完全在 rig 的 agent loop 里，shion 只能看到最终结果和工具调用记录，不能稳定控制中间策略。
+
+已落地的第一块是 `todo`：模型可维护当前会话的步骤列表，最多一个 `in_progress`。
+
+仍缺：
+
+- 澄清问题：信息不足时先问，而不是盲目执行。
+- 工具失败重试：区分瞬时错误、环境错误、不可重试错误。
+- 预算限制：时间、token、工具调用次数、风险等级。
+- 中途产物保存：长任务先落草稿或 run artifact。
+- 取消/暂停/恢复长任务。
+
+架构前提：要做这些控制点，就需要把工具循环逐步从 rig 收回 `AgentRuntime`，让 rig 只承担单次 completion。这个重写有回归风险，应该由具体消费者驱动，首选从"工具瞬时错误自动重试"或"工具调用次数预算"开始。
+
+## 8. 本地快捷入口
+
+远程/聊天入口已经够用，但本地"随手丢给 shion"还不够顺。
+
+可选项：
+
+- unix socket channel：方便脚本、Raycast、Automator、快捷指令调用。
+- 剪贴板 / share sheet 入口：快速把一段文本、URL、文件交给 shion。
+- 浏览器当前页入口：保存、总结、转 task/memory。
+
+这些不是架构前置，但会显著提高日常使用频率。
 
 ## 9. 可观察性与 inspect
 
-`shion cron list`、`shion session list/clean` 已经存在。随着状态增多，继续补齐：
+已有 operator 视图：
 
-- `shion inspect tasks`
-- `shion inspect memories`
-- `shion inspect skills`
-- `shion inspect runs`
-- `shion inspect gateway`
+- `shion cron list`
+- `shion session list/clean`
+- `shion task list`
+- `shion run list/inspect`
+- `shion memory list/search/promote/reject/pin`
+- `shion pair list/approve/revoke`
+- `shion logs`
+- `shion workday`
 
-目标是让用户能随时看懂 shion 当前知道什么、正在做什么、为什么这样做。
+还可以补：
+
+- gateway 状态聚合：channels、home channel、maintenance、last error。
+- skill inspect / skill governance。
+- config health：哪些 channel 已启用、哪些凭证缺失、哪些 proactive sweep 正在运行。
+- run ledger prune。
+- memory quality report：候选、长期未用、低置信、高频命中。
+
+目标是让用户随时看懂 shion 当前知道什么、正在做什么、为什么这样做。
 
 ## 10. 文档与代码同步
 
-文档落后于源码会直接影响后续 agent 对仓库的判断（曾出现过的例子：AGENTS.md 声称"只发最后一条用户消息"而实际已发送完整历史、一批空占位目录误导代码导航——均已修复）。需要持续同步：
+文档落后会直接误导后续 agent。当前仓库刻意只保留一份长期路线图：
 
-- README：面向用户的当前能力
-- AGENTS.md：面向 coding agent 的真实架构和命令
-- `docs/ARCHITECTURE.md`：长期架构设计
-- 本文档：产品能力缺口和路线图
+- README：面向用户的当前能力、安装、配置和运行方式。
+- AGENTS.md：面向 coding agent 的真实架构、命令和工程约束。
+- `docs/personal-agent-roadmap.md`：产品能力缺口和推荐实现顺序。
+
+历史设计稿和已落地执行计划已删除，避免继续引用过期事实。以后新增长文档前先判断是否应该并入 README、AGENTS 或本 roadmap。
 
 ## 推荐实现顺序
 
-如果只选一条最有价值的路线，建议按下面顺序（ingress 入口已落地，第 1 节不再占位）：
+如果只选一条最有价值的路线，建议按下面顺序：
 
-1. ✅ `Task` 单表领域模型（含 `inbox` 状态与 `waiting_on`）+ `task` tool + 基础 inspect（第 2 节）
-2. ✅ 后台权限策略，替换 gateway 的一刀切 DenyApprover（第 3 节，`ChatApprover` 交互式审批）
-3. ✅ gateway maintenance 中加入 daily briefing，投递走 channel `home_chat`（第 4 节，opt-in）
-4. ✅ reviewer 增加承诺提取方向，capture 进 task inbox（第 2 节）
-5. 飞书日历只读连接器，与 feishu channel 共享鉴权（第 5 节）
-6. ✅ 强化 memory 来源和过期机制（第 6 节；细分类/confidence 暂缓）
-7. ✅ 为长任务加入 `Run` / `RunStep` 记录（第 7 节，记录层 + 全局 tracing；resume 待做）
+1. 飞书日历只读连接器，与 Feishu channel 共享鉴权。
+2. daily briefing 接入日历，输出今天日程、冲突、空闲时间。
+3. 每周摘要：完成事项、卡住项目、待清理记忆、长期承诺。
+4. planner 控制点第一步：工具瞬时错误自动重试或工具调用次数预算。
+5. run resume：从已有 run ledger 恢复中断任务。
+6. 权限策略配置化：目录、命令前缀、网络域名、channel/session scope。
+7. memory recall 质量升级：aux recall agent，再考虑 embedding/hybrid search。
+8. 本地 unix socket / Raycast / share sheet 入口。
+9. operator health：gateway/config/skill/memory quality/report/prune。
 
-前两步加上已有的 ingress 合起来才构成从"聊天工具"到"个人 agent"的那次跨越；其余都可以在这个闭环跑起来之后逐步加。
+已经完成的里程碑：ingress、durable task、commitment extraction、ChatApprover、daily briefing、memory L1/L2/L3、run ledger、recurring reminders、WeChat、Home Assistant。下一阶段不该再补零散工具，而应该把这些骨架接上真实个人上下文，并让执行过程可控、可恢复、可审计。

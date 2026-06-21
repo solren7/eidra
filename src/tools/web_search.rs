@@ -42,6 +42,11 @@ impl Tool for WebSearchTool {
         "Search the web and return the top result titles, URLs, and snippets."
     }
 
+    /// Read-only query: safe to retry on an ambiguous transient failure.
+    fn idempotent(&self) -> bool {
+        true
+    }
+
     fn parameters_schema(&self) -> serde_json::Value {
         json!({
             "type": "object",

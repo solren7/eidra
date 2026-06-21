@@ -1,9 +1,9 @@
 # shion
 
-A personal agent framework in Rust. One binary gives you an interactive
-LLM chat with tools (shell, files, web, reminders, memory) and an
-always-on background gateway that runs scheduled maintenance and
-delivers reminders — all stored locally under `~/.shion`.
+A personal agent framework in Rust. One binary gives you interactive LLM chat,
+local tools, durable tasks and memories, scheduled reminders, and an always-on
+gateway for chat channels and proactive background work. State lives locally
+under `~/.shion`.
 
 ## Install
 
@@ -30,21 +30,27 @@ shion model list                 # show current provider/model
 shion model set anthropic        # switch provider (persists to config.toml)
 ```
 
-Inside chat, `/new` (or `/clear`) starts a fresh session. Every run
-starts a new session; history is stored in `~/.shion/shion.db`.
+Inside chat, `/new` (or `/clear` / `/reset`) starts a fresh session. History and
+the run ledger are stored in `~/.shion/shion.db`.
 
 ```bash
 shion session list               # stored sessions with message counts
 shion session clean              # delete empty sessions
 shion cron list                  # pending reminders and next fire times
+shion task list                  # open durable tasks
+shion memory list                # memory candidates/active items
+shion run list                   # recent agent turns
 ```
 
 ## Gateway (always-on background process)
 
-The gateway hosts scheduled maintenance — a reflective review sweep
-over past sessions (on the configured cron, hourly by default) and a
-reminder sweep that delivers due reminders via macOS notifications
-every minute.
+The gateway hosts chat/event ingress and scheduled maintenance:
+
+- reflective review sweeps over stored sessions
+- one-shot and recurring reminder delivery
+- task due notifications
+- optional daily briefing
+- Feishu, Telegram, WeChat, and Home Assistant channels when configured
 
 ```bash
 shion gateway start              # install + start under launchd (auto-restart, login start)
@@ -54,8 +60,8 @@ shion gateway stop               # stop and remove from launchd
 ```
 
 Bare `shion gateway` runs in the foreground (this is what launchd
-invokes). The gateway is non-interactive: side-effecting tools are
-denied rather than blocking on a prompt.
+invokes). In chat channels, side-effecting tools can ask for approval in the
+conversation; reply `/approve`, `/approve session`, or `/deny`.
 
 ## Built-in tools
 
@@ -67,17 +73,34 @@ The agent can call these during a chat turn:
 | `file` | Read/write files in the workspace |
 | `web_fetch` / `web_search` | Fetch pages and search the web |
 | `reminder` | Schedule one-shot and recurring reminders |
-| `memory` | Persistent notes as markdown files under `~/.shion/memory` |
+| `task` | Capture/list/update/complete durable cross-session tasks |
+| `todo` | Maintain the current session's working focus list |
+| `memory` | Govern long-term memories in `~/.shion/memory.db` |
+| `homeassistant` | Read and control Home Assistant entities when configured |
 | `session` | Look up past conversations |
 | `delegate` | Hand a sub-task to a cheaper auxiliary model |
 | `skill` | Run user-defined skills from `skills/` |
 | `time` | Current time (RFC 3339 UTC) |
 
+## Data Layout
+
+Everything lives in `~/.shion/` by default, or under `SHION_HOME` when set.
+
+| File | Purpose |
+|---|---|
+| `shion.db` | disposable session state: messages, todos, pairings, settings, reminders, run ledger |
+| `kanban.db` | durable cross-session tasks |
+| `memory.db` | durable long-term memories |
+| `config.toml` | provider/model/channel behavior |
+| `.env` | API keys and channel credentials |
+
+Delete `shion.db` freely to reset development state. Do not delete `kanban.db`
+or `memory.db` unless you intend to wipe durable personal data.
+
 ## Configuration
 
-Everything lives in `~/.shion/` (relocatable via `SHION_HOME`).
-Priority: built-in defaults < `config.toml` < `SHION_*` env vars.
-API keys go only in `~/.shion/.env`, never in `config.toml`.
+Priority: built-in defaults < `config.toml` < `SHION_*` env vars. API keys go
+only in `~/.shion/.env`, never in `config.toml`.
 
 `~/.shion/config.toml`:
 
@@ -87,7 +110,28 @@ model = "deepseek-chat"      # optional; defaults per provider
 base_url = "https://..."     # optional override for OpenAI-compatible endpoints
 aux_model = "..."            # optional cheaper model for delegated sub-tasks
 schedule = "0 * * * *"       # gateway maintenance cron (5-field, default hourly)
+briefing_schedule = "0 8 * * *"      # optional daily briefing
+briefing_workdays_only = true        # optional Chinese workday gate
 max_turns = 30               # max tool-calling round-trips per user turn
+
+[channels.telegram]
+enabled = true
+allow_from = ["123456789"]
+home_chat = "123456789"
+
+[channels.feishu]
+enabled = true
+allow_from = ["ou_xxx"]
+home_chat = "oc_xxx"
+
+[channels.wechat]
+enabled = true
+allow_from = ["wxid_xxx"]
+
+[channels.homeassistant]
+enabled = true
+watch_domains = ["binary_sensor", "lock"]
+cooldown_seconds = 30
 ```
 
 | Provider | API key env var |
@@ -97,26 +141,37 @@ max_turns = 30               # max tool-calling round-trips per user turn
 | `anthropic` | `ANTHROPIC_API_KEY` |
 | `openrouter` | `OPENROUTER_API_KEY` |
 
+Channel credentials live in `.env`, for example:
+
+```bash
+FEISHU_APP_ID=cli_xxx
+FEISHU_APP_SECRET=xxx
+TELEGRAM_BOT_TOKEN=xxx
+HASS_TOKEN=xxx
+HASS_URL=http://homeassistant.local:8123
+```
+
+WeChat is QR-based: run `shion wechat login` on the host, or send `/wechat login`
+from an already-working chat channel.
+
 ## Architecture
 
-DDD-style layers; see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for detail.
+DDD-style layers with domain traits at the center:
 
 ```
-CLI → AgentRuntime → Planner → ToolRegistry → MessageRepository → Response
+CLI/channel → AgentRuntime → LlmClient/rig → ToolRegistry → tool
+                         ↘ repositories + run ledger → Response
 ```
 
-- `domain/` — pure traits and value types, no I/O (`Planner`, `Tool`,
-  `LlmClient`, `SessionRepository`, `MessageRepository`, …)
-- `agent/` — application logic: `AgentRuntime` (session lifecycle),
-  the gateway, the maintenance daemon, the reflective reviewer
-- `infra/` — implementations: SQLite via toasty, LLM clients via
-  `rig`, markdown memory, macOS notifier
+- `domain/` — pure traits and value types, no I/O
+- `agent/` — runtime, gateway, maintenance daemon, reviewer, system prompt
+- `infra/` — SQLite via toasty, LLM via rig, messaging channels, notifiers
 - `tools/` — built-in tools; `services/` — tool registry
 - `cli/` — subcommand wiring
 
-Each layer depends only on `domain` traits, so the LLM provider,
-persistence backend, planner, and tools are all swappable without
-touching `agent/`.
+The LLM owns tool dispatch through rig's function-calling loop. Every tool call
+funnels through `execute_isolated`, where it is isolated, traced, and recorded
+in the run ledger when a turn is active.
 
 ## Development
 
@@ -125,8 +180,19 @@ cargo check          # fast compile check
 cargo test           # run all tests
 cargo fmt            # format
 cargo run -- chat    # run from source
+cargo run -- gateway # foreground gateway
 ```
 
-`~/.shion/shion.db` is disposable — delete it freely to reset, and
-always delete it after a schema change (the schema is only pushed for
-newly created database files).
+Building requires `protoc` (`brew install protobuf`) because the Feishu websocket
+dependency compiles protobuf frames at build time.
+
+To reset after schema changes, delete the affected database file:
+
+- `TaskRecord` changes: `~/.shion/kanban.db`
+- `MemoryRecord` changes: `~/.shion/memory.db`
+- other toasty models: `~/.shion/shion.db`
+
+## Roadmap
+
+The only long-form docs file kept in this repository is the current roadmap:
+[docs/personal-agent-roadmap.md](docs/personal-agent-roadmap.md).
