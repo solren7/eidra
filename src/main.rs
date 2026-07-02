@@ -6,6 +6,12 @@ mod infra;
 mod services;
 mod tools;
 
+// Global allocator: mimalloc — installed by turso's default `mimalloc`
+// feature (via toasty-driver-turso), not declared here. Declaring our own
+// `#[global_allocator]` is a hard link error while that feature is on:
+//   error: the `#[global_allocator]` in this crate conflicts with global allocator in: turso
+// If turso/toasty ever stop providing one, declare mimalloc here explicitly.
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // cwd .env first (developer override), then ~/.shion/.env.
