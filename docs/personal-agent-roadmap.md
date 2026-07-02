@@ -19,29 +19,18 @@
 - run ledger 已记录每个 turn 和每次工具调用，CLI 可 `shion run list/inspect`。
 - 已有 operator CLI：`cron`、`session`、`task`、`run`、`memory`、`pair`、`model`、`wechat`、`workday`、`logs`、`doctor`、`dream`、`upgrade`。
 
-总体判断：**shion 已经不是单纯聊天工具，下一阶段缺的是更完整的主动协作闭环**。入口、任务、记忆和审计已经有骨架；价值瓶颈转移到了真实个人上下文、执行控制、权限策略产品化，以及可恢复的长任务。
+总体判断：**shion 是一个简洁的 agent core，能力扩展走 skill，不往 core 里堆连接器**。入口、任务、记忆和审计已经有骨架；下一阶段 core 只做四件事——权限策略产品化、memory 质量、run resume、skill governance。日历/邮件/笔记这类真实数据源由 skill 接入（用现有通用工具调 API），core 提供的是让 skill 安全好用的地基。
 
-## 1. 真实个人数据连接器
+## 1. 真实个人数据：走 skill，不进 core
 
-个人 agent 的价值来自真实上下文。当前 shion 有聊天入口和 Home Assistant，但还缺工作/生活数据源的只读连接器。
+个人 agent 的价值来自真实上下文，但连接器**不编译进 shion**。日历、邮件、外部任务、Notion/Obsidian、本地文件夹这类数据源，用 skill（指导 agent 拿现有通用工具 `web_fetch`/`shell`/`file` 调 API 的知识文件）接入。core 不新增 per-service 工具，保持简洁。
 
-优先级最高的是 **飞书日历只读连接器**，因为它能直接提升 briefing 和日常协作质量：
+这个取舍对 core 的真实要求，恰好就是本路线图的四个重点：
 
-- 今天/本周日程
-- 会议冲突
-- 空闲时间
-- 即将开始的会议提醒
-- 会后待办/纪要入口
-
-下一批连接器按价值排序：
-
-- 飞书邮件：未读、待回复、重要线程
-- 飞书任务或外部任务系统：同步已有任务，而不是让 shion 另起孤岛
-- Notion / Obsidian / 本地 markdown：检索长期笔记
-- 浏览器当前页：总结、保存、转任务
-- 本地文件夹：最近文件、下载目录、项目目录
-
-原则：每个连接器先只读，再做写入；写入必须经过第 3 节的权限策略。
+- **权限策略（§3）**：skill 驱动的 API 调用要靠可配置的域名/命令授权自动放行，而不是每次人工 `/approve`。
+- **skill governance（§9）**：连接器逻辑活在 skill 里，skill 的审查、保护、来源追溯就是连接器的质量线。
+- 凭证仍集中在 `~/.shion/.env`，skill 文本里不放 secrets。
+- 原则不变：先只读后写入，写入必须过权限策略并进 run ledger。
 
 ## 2. 主动摘要升级
 
@@ -49,8 +38,7 @@
 
 当前缺口：
 
-- briefing 还没有接日历，所以无法包含今天会议、空闲时间、会议冲突。
-- briefing 还没有接邮件/外部任务，因此无法提醒待回复线程和外部系统里的待办。
+- briefing 是 tool-less 的 aux LLM 一次性调用，接不了外部数据。要包含日历/邮件，走的路是"briefing 组装时允许调 skill/工具"，而不是往 core 加连接器——这依赖 §3 的权限策略先落地（无人值守的 sweep 只能执行策略明确放行的动作）。
 - 每周摘要尚未实现，但框架已经够用：换 prompt、换 cron、读取完成任务和近期 run/memory 即可。
 
 每日摘要最终应包含：
@@ -174,15 +162,7 @@ run ledger 的记录层已经落地：
 
 ## 8. 本地快捷入口
 
-远程/聊天入口已经够用，但本地"随手丢给 shion"还不够顺。
-
-可选项：
-
-- unix socket channel：方便脚本、Raycast、Automator、快捷指令调用。
-- 剪贴板 / share sheet 入口：快速把一段文本、URL、文件交给 shion。
-- 浏览器当前页入口：保存、总结、转 task/memory。
-
-这些不是架构前置，但会显著提高日常使用频率。
+api channel 的 loopback HTTP 已经覆盖这个需求的大半：脚本、Raycast、Automator、快捷指令都可以直接 `POST /v1/chat/completions`（`~/.shion/gateway.json` 里有地址和 key）。不再计划新的本地 channel；剪贴板 / share sheet / 浏览器页入口如果要做，是调 api channel 的外围小工具，不进 core。
 
 ## 9. 可观察性与 inspect
 
@@ -201,9 +181,12 @@ run ledger 的记录层已经落地：
 - `shion run prune`
 - `shion dream`：dreaming 预览/手动执行
 
-还可以补：
+还可以补——**skill governance**（连接器走 skill 后，这从"锦上添花"升级为核心设施）：
 
-- skill inspect / skill governance。
+- skill inspect：单个 skill 的全文、来源（用户写入 / reviewer 提取）、修改历史。
+- 启停与保护：disable 一个可疑 skill 而不删除；`protected` 语义明确化（谁能改、agent 能否自改）。
+- 来源追溯与审查：reviewer 自动提取的 skill 应像 memory candidate 一样有 triage 流程，而不是直接生效。
+- skill 调用审计：run ledger 里能看到某次 turn 用了哪个 skill。
 
 目标是让用户随时看懂 shion 当前知道什么、正在做什么、为什么这样做。
 
@@ -219,15 +202,13 @@ run ledger 的记录层已经落地：
 
 ## 推荐实现顺序
 
-如果只选一条最有价值的路线，建议按下面顺序：
+core 只做四件事，按依赖顺序：
 
-1. 飞书日历只读连接器，与 Feishu channel 共享鉴权。
-2. daily briefing 接入日历，输出今天日程、冲突、空闲时间。
-3. 每周摘要：完成事项、卡住项目、待清理记忆、长期承诺。
-4. run resume：从已有 run ledger 恢复中断任务。
-5. 权限策略配置化：目录、命令前缀、网络域名、channel/session scope。
-6. memory recall 质量升级：aux recall agent，再考虑 embedding/hybrid search。
-7. 本地 unix socket / Raycast / share sheet 入口（api channel 已可承接一部分：本地脚本可直接打 loopback HTTP）。
-8. skill inspect / skill governance。
+1. **权限策略配置化（§3）**：目录、命令前缀、网络域名、channel/session scope 的可配置放行，独立 policy 层。它是 skill 生态和无人值守 sweep 的地基，排第一。
+2. **memory 质量（§5）**：aux recall agent、candidate 批量 triage 体验、dreaming 的 query-diversity 信号；embedding/hybrid search 之后再说。
+3. **run resume（§6）**：从已有 run ledger 恢复中断任务，`recoverable` 字段由它驱动加入。
+4. **skill governance（§9）**：inspect、启停/保护、triage 流程、调用审计——连接器走 skill 的前提设施。
 
-已经完成的里程碑：ingress、durable task、commitment extraction、ChatApprover、daily briefing、memory L1/L2/L3 + dreaming、run ledger + prune、recurring reminders、WeChat、Home Assistant、in-house tool loop（重试/预算）、api channel + CLI 路由、operator health（doctor / memory report）。下一阶段不该再补零散工具，而应该把这些骨架接上真实个人上下文，并让执行过程可控、可恢复、可审计。
+明确不做进 core 的：日历/邮件/笔记等数据连接器（走 skill）、briefing 的连接器化增强（等 §3 落地后由 skill 提供数据）、本地快捷入口的新 channel（api channel 的 loopback HTTP 已可承接脚本/Raycast）。
+
+已经完成的里程碑：ingress、durable task、commitment extraction、ChatApprover、daily briefing、memory L1/L2/L3 + dreaming、run ledger + prune、recurring reminders、WeChat、Home Assistant、in-house tool loop（重试/预算）、api channel + CLI 路由、operator health（doctor / memory report）。下一阶段的主题是：**core 收敛，生态外放**——把权限、记忆、恢复、治理做扎实，让 skill 安全地承接一切具体能力。
