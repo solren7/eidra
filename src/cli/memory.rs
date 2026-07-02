@@ -142,6 +142,94 @@ pub async fn reject(url: &str, ids: &[String]) -> anyhow::Result<()> {
     transition_batch(url, ids, "reject", Memory::reject, "Rejected").await
 }
 
+/// Interactively triage the candidate pile: one prompt per candidate,
+/// **oldest first** — the oldest are closest to dreaming's 30-day archive
+/// line, so they get the operator's eye before the sweep quietly retires
+/// them. `p` promote / `r` reject / `s` skip / `q` quit.
+pub async fn triage(url: &str) -> anyhow::Result<()> {
+    let mut candidates: Vec<Memory> = load_all(url)
+        .await?
+        .into_iter()
+        .filter(|m| m.status == MemoryStatus::Candidate)
+        .collect();
+    if candidates.is_empty() {
+        println!("(no candidates to triage)");
+        return Ok(());
+    }
+    candidates.sort_by_key(|m| m.created_at);
+
+    let store = write_store(url).await?;
+    let total = candidates.len();
+    let (mut promoted, mut rejected, mut skipped, mut failed) = (0usize, 0usize, 0usize, 0usize);
+    println!("{total} candidate(s) to triage — p=promote  r=reject  s=skip  q=quit\n");
+    'items: for (i, m) in candidates.iter().enumerate() {
+        println!("[{}/{total}] {}", i + 1, line(m));
+        let (action, apply, bucket): (&str, fn(&mut Memory, i64), &mut usize) = loop {
+            match triage_choice(read_choice("  p/r/s/q> ").await?.as_deref()) {
+                TriageChoice::Quit => break 'items,
+                TriageChoice::Promote => break ("promote", Memory::promote, &mut promoted),
+                TriageChoice::Reject => break ("reject", Memory::reject, &mut rejected),
+                TriageChoice::Skip => {
+                    skipped += 1;
+                    continue 'items;
+                }
+                TriageChoice::Invalid => println!("  (p=promote  r=reject  s=skip  q=quit)"),
+            }
+        };
+        match transition(&store, &m.id, action, apply).await {
+            Ok(()) => *bucket += 1,
+            Err(error) => {
+                failed += 1;
+                eprintln!("  ✗ {error}");
+            }
+        }
+    }
+
+    println!("\npromoted {promoted}, rejected {rejected}, skipped {skipped}");
+    if failed > 0 {
+        anyhow::bail!("{failed} transition(s) failed");
+    }
+    Ok(())
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum TriageChoice {
+    Promote,
+    Reject,
+    Skip,
+    Quit,
+    Invalid,
+}
+
+/// The triage keymap, on an already trimmed+lowercased line (`None` = EOF).
+/// EOF quits (piped stdin ran dry, Ctrl-D); a bare Enter skips — the idle
+/// keystroke must never mutate.
+fn triage_choice(input: Option<&str>) -> TriageChoice {
+    match input {
+        None | Some("q") => TriageChoice::Quit,
+        Some("p") => TriageChoice::Promote,
+        Some("r") => TriageChoice::Reject,
+        Some("s") | Some("") => TriageChoice::Skip,
+        Some(_) => TriageChoice::Invalid,
+    }
+}
+
+/// One trimmed, lowercased line from stdin (`None` on EOF). The blocking read
+/// runs off the async runtime, same as the CLI approver's prompt.
+async fn read_choice(prompt: &str) -> anyhow::Result<Option<String>> {
+    use std::io::Write;
+    print!("{prompt}");
+    std::io::stdout().flush()?;
+    let line = tokio::task::spawn_blocking(|| {
+        let mut buf = String::new();
+        std::io::stdin()
+            .read_line(&mut buf)
+            .map(|n| (n > 0).then_some(buf))
+    })
+    .await??;
+    Ok(line.map(|s| s.trim().to_lowercase()))
+}
+
 /// Pin a memory into the L1 per-turn profile (the manual, explicit path —
 /// automated extraction never pins). Raises confidence so it actually surfaces.
 pub async fn pin(url: &str, id: &str) -> anyhow::Result<()> {
@@ -269,4 +357,24 @@ fn line(m: &Memory) -> String {
         s.push_str(&format!("  (from {})", m.source));
     }
     s
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn triage_keymap_maps_choices_and_defaults_safely() {
+        assert_eq!(triage_choice(Some("p")), TriageChoice::Promote);
+        assert_eq!(triage_choice(Some("r")), TriageChoice::Reject);
+        assert_eq!(triage_choice(Some("s")), TriageChoice::Skip);
+        assert_eq!(triage_choice(Some("q")), TriageChoice::Quit);
+        assert_eq!(triage_choice(None), TriageChoice::Quit, "EOF quits");
+        assert_eq!(
+            triage_choice(Some("")),
+            TriageChoice::Skip,
+            "bare Enter must never mutate"
+        );
+        assert_eq!(triage_choice(Some("x")), TriageChoice::Invalid);
+    }
 }

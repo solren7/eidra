@@ -221,6 +221,9 @@ enum MemoryAction {
         /// Memory id
         id: String,
     },
+    /// Interactively triage the candidate pile (oldest first): p=promote,
+    /// r=reject, s=skip, q=quit
+    Triage,
     /// Quality report: counts by status/confidence + piles needing triage
     Report,
 }
@@ -311,6 +314,7 @@ pub async fn run() -> anyhow::Result<()> {
                 MemoryAction::Promote { ids } => memory::promote(&url, &ids).await,
                 MemoryAction::Reject { ids } => memory::reject(&url, &ids).await,
                 MemoryAction::Pin { id } => memory::pin(&url, &id).await,
+                MemoryAction::Triage => memory::triage(&url).await,
                 MemoryAction::Report => memory::report(&url).await,
             }
         }
