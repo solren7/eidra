@@ -116,8 +116,9 @@ pub async fn build(
     let aux_config = model_config.aux_variant();
     let aux_builder = Arc::new(SystemPromptBuilder::new(&aux_config));
     let aux_preamble: PreambleFn = Arc::new(move || aux_builder.build());
-    // Aux/delegate sub-agents must not be fed the user's memory library.
-    let aux_llm = build_llm(&aux_config, Vec::new(), aux_preamble, None)?;
+    // Aux/delegate sub-agents must not be fed the user's memory library — and
+    // the aux agent never gets an aux of its own (no recursion).
+    let aux_llm = build_llm(&aux_config, Vec::new(), aux_preamble, None, None)?;
     tools.register(Arc::new(DelegateTool::new(aux_llm.clone())));
 
     // Skills load from, in priority order (first to define a name wins):
@@ -170,12 +171,14 @@ pub async fn build(
     let preamble: PreambleFn = Arc::new(move || prompt_builder.build());
 
     // Hand the same tool instances to the LLM so the model can call them, plus
-    // the memory store for L1 pinned injection (main agent only).
+    // the memory store for L1 pinned injection and the aux agent for recall
+    // screening (main agent only).
     let llm = build_llm(
         &model_config,
         tools.tools(),
         preamble,
         Some(memory_repo.clone()),
+        Some(aux_llm.clone()),
     )?;
     let skill_repo: Arc<dyn SkillRepository> = db.clone();
     let reviewer: Arc<dyn Reviewer> = Arc::new(ReflectiveReviewer::new(
