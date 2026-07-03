@@ -230,7 +230,7 @@ async fn aux_select_recall(
     let mut session = Session::new("recall-select");
     session
         .messages
-        .push(Message::user(&aux_recall_prompt(user_msg, &hits)));
+        .push(Message::user(aux_recall_prompt(user_msg, &hits)));
     match tokio::time::timeout(AUX_RECALL_TIMEOUT, aux.complete(&session)).await {
         Ok(Ok(reply)) => {
             if let Some(kept) = apply_aux_selection(&hits, &reply) {
