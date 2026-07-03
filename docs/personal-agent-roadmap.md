@@ -208,7 +208,7 @@ api channel 的 loopback HTTP 已经覆盖这个需求的大半：脚本、Rayca
 
 core 只做四件事，按依赖顺序：
 
-1. **权限策略配置化（§3）**：目录、命令前缀、网络域名、channel/session scope 的可配置放行，独立 policy 层。它是 skill 生态和无人值守 sweep 的地基，排第一。
+1. ~~**权限策略配置化（§3）**~~ ✅ 已落地（`.scratch/permission-policy/PRD.md`）：独立 policy 层 + deny-only 读操作 + `shion policy` 操作面；剩 `unattended` 窄通道，挂起到 briefing-via-skill 出现。
 2. ~~**memory 质量（§5）**~~ ✅ 已落地（`.scratch/memory-quality/PRD.md`）：aux recall agent、candidate 批量 triage、dreaming query-diversity；embedding/hybrid search 仍然后置。
 3. ~~**run resume（§6）**~~ ✅ 已落地（`.scratch/run-resume/PRD.md`）：`shion run resume` 重派中断 turn，`recoverable` 由 reconcile 置位、resume 清零。
 4. ~~**skill governance（§9）**~~ ✅ 已落地（`.scratch/skill-governance/PRD.md`）：文件系统为唯一事实源，triage/保护/启停/审计齐备。
