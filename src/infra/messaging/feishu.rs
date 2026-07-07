@@ -38,6 +38,7 @@ use crate::{
     },
     config::FeishuConfig,
     domain::{gateway::ReplySink, pairing::PairingRepository},
+    infra::messaging::reconnect_backoff,
 };
 
 const FEISHU_BASE_URL: &str = "https://open.feishu.cn";
@@ -45,7 +46,6 @@ const FEISHU_BASE_URL: &str = "https://open.feishu.cn";
 const TOKEN_REFRESH_MARGIN: Duration = Duration::from_secs(300);
 /// Remember this many recent message ids to drop redelivered events.
 const DEDUP_CAPACITY: usize = 256;
-const RECONNECT_DELAY: Duration = Duration::from_secs(5);
 
 /// Outbound side of the integration: tenant token cache + message send.
 /// Shared by the ingress channel (replies) and the `HomeNotifier` (proactive
@@ -315,6 +315,7 @@ fn spawn_ws_thread(
         runtime.block_on(async move {
             // The dispatcher is consumed by each `open` call, so it is
             // rebuilt per attempt.
+            let mut backoff = 0usize;
             loop {
                 if *shutdown.borrow() {
                     break;
@@ -333,6 +334,7 @@ fn spawn_ws_thread(
                         return;
                     }
                 };
+                let started = std::time::Instant::now();
                 tokio::select! {
                     _ = shutdown.changed() => break,
                     result = LarkWsClient::open(ws_config.clone(), dispatcher) => match result {
@@ -340,10 +342,18 @@ fn spawn_ws_thread(
                         Err(error) => warn!(%error, "feishu connection failed; reconnecting"),
                     }
                 }
+                // A connection that stayed up a while was healthy: reset the
+                // backoff so a later blip starts from the short delay. A fast
+                // failure (e.g. bad credentials) escalates it instead of
+                // hammering the WebSocket every few seconds.
+                if started.elapsed() >= reconnect_backoff(0) {
+                    backoff = 0;
+                }
                 tokio::select! {
                     _ = shutdown.changed() => break,
-                    _ = tokio::time::sleep(RECONNECT_DELAY) => {}
+                    _ = tokio::time::sleep(reconnect_backoff(backoff)) => {}
                 }
+                backoff += 1;
             }
         });
     })

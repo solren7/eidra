@@ -43,14 +43,9 @@ const SESSION_ID: &str = "homeassistant:events";
 /// HA persistent-notification message cap.
 const MAX_MESSAGE_LENGTH: usize = 4096;
 
-/// Reconnect backoff schedule (seconds), clamped at the last step.
-const BACKOFF_STEPS: [u64; 4] = [5, 10, 30, 60];
-
 type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
-fn backoff_delay(idx: usize) -> Duration {
-    Duration::from_secs(BACKOFF_STEPS[idx.min(BACKOFF_STEPS.len() - 1)])
-}
+use super::reconnect_backoff as backoff_delay;
 
 /// Returns `true` if shutdown was requested while waiting.
 async fn sleep_or_shutdown(shutdown: &mut watch::Receiver<bool>, delay: Duration) -> bool {

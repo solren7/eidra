@@ -33,12 +33,12 @@ use crate::{
     },
     config::TelegramConfig,
     domain::{gateway::ReplySink, pairing::PairingRepository},
+    infra::messaging::reconnect_backoff,
 };
 
 const TELEGRAM_BASE_URL: &str = "https://api.telegram.org";
 /// Long-poll wait passed to `getUpdates`.
 const POLL_TIMEOUT: Duration = Duration::from_secs(30);
-const RECONNECT_DELAY: Duration = Duration::from_secs(5);
 
 /// Outbound side of the integration. Shared by the ingress channel (replies)
 /// and the `HomeNotifier` (proactive messages to the home chat).
@@ -264,7 +264,9 @@ impl Channel for TelegramChannel {
         mut shutdown: watch::Receiver<bool>,
     ) -> anyhow::Result<()> {
         // The group mention gate needs the bot's username; keep retrying so a
-        // gateway started offline comes up once the network does.
+        // gateway started offline comes up once the network does. Back off on
+        // repeated failures (a bad token would otherwise hammer getMe).
+        let mut backoff = 0usize;
         let username = loop {
             tokio::select! {
                 _ = shutdown.changed() => return Ok(()),
@@ -274,8 +276,9 @@ impl Channel for TelegramChannel {
                         warn!(%error, "telegram getMe failed; retrying");
                         tokio::select! {
                             _ = shutdown.changed() => return Ok(()),
-                            _ = tokio::time::sleep(RECONNECT_DELAY) => {}
+                            _ = tokio::time::sleep(reconnect_backoff(backoff)) => {}
                         }
+                        backoff += 1;
                     }
                 }
             }
@@ -287,17 +290,24 @@ impl Channel for TelegramChannel {
         // id keys the session, so a private chat is one continuous
         // conversation.
         let mut offset = 0i64;
+        let mut backoff = 0usize;
         loop {
             let updates = tokio::select! {
                 _ = shutdown.changed() => break,
                 result = self.sender.get_updates(offset) => match result {
-                    Ok(updates) => updates,
+                    // A successful long-poll (even an empty batch) clears the
+                    // backoff so the next failure starts from the short delay.
+                    Ok(updates) => {
+                        backoff = 0;
+                        updates
+                    }
                     Err(error) => {
                         warn!(%error, "telegram polling failed; retrying");
                         tokio::select! {
                             _ = shutdown.changed() => break,
-                            _ = tokio::time::sleep(RECONNECT_DELAY) => {}
+                            _ = tokio::time::sleep(reconnect_backoff(backoff)) => {}
                         }
+                        backoff += 1;
                         continue;
                     }
                 }
