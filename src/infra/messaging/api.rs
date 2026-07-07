@@ -42,7 +42,7 @@ use tokio::sync::watch;
 use tracing::{info, warn};
 
 use crate::{
-    agent::{gateway::Channel, interaction::GatewayDispatcher},
+    agent::{daemon::DreamSweep, gateway::Channel, interaction::GatewayDispatcher},
     config::ApiConfig,
     domain::{
         gateway::MessageHandler,
@@ -51,7 +51,7 @@ use crate::{
             DreamVerdict, Memory, MemoryRepository, MemoryStatus, dream_score, dream_verdict,
             parse_memory_status,
         },
-        pairing::{PairingRepository, PairingStatus},
+        pairing::{ApproveOutcome, PairingRepository, PairingStatus},
         reminder::ReminderRepository,
         repository::{MessageRepository, SessionRepository, SkillRepository},
         run::{RunRepository, RunStep, resume_prompt, step_views_skill},
@@ -192,11 +192,16 @@ fn build_router(state: AppState) -> Router {
         .route("/api/runs", get(list_runs))
         .route("/api/runs/{id}", get(get_run))
         .route("/api/runs/{id}/resume", post(resume_run))
+        .route("/api/runs/prune", post(prune_runs))
+        .route("/api/sessions/clean", post(clean_sessions))
         .route("/api/reminders", get(list_reminders))
         .route("/api/skills", get(list_skills))
         .route("/api/skills/{name}/audit", get(skill_audit))
         .route("/api/pairings", get(list_pairings))
+        .route("/api/pairings/approve", post(pair_approve))
+        .route("/api/pairings/{id}/revoke", post(pair_revoke))
         .route("/api/dream", get(dream_preview))
+        .route("/api/dream/apply", post(dream_apply))
         .route_layer(middleware::from_fn_with_state(state.clone(), require_auth));
 
     Router::new()
@@ -628,6 +633,112 @@ async fn resume_run(
         steps: steps.len(),
         reply,
     })
+    .into_response())
+}
+
+// ---- control-plane write endpoints (loopback-only) -------------------------
+//
+// These back the maintenance CLIs (`run prune`, `session clean`,
+// `pair approve|revoke`, `dream --apply`) while the gateway holds the db lock.
+// Like memory governance and trusted chat, they are **loopback-gated** — a
+// publicly-bound api (`[channels.api] enabled = true`) never gets them.
+
+/// 403 response body for an off-loopback control-plane write.
+fn loopback_only(action: &str) -> Response {
+    (
+        StatusCode::FORBIDDEN,
+        Json(json!({ "error": format!("{action} is loopback-only") })),
+    )
+        .into_response()
+}
+
+#[derive(Deserialize)]
+struct PruneParams {
+    cutoff: i64,
+}
+
+/// Drop runs (and their steps) started before `cutoff`. The client resolves
+/// `--before`/`--keep` into the cutoff (it can read runs over `/api/runs`).
+async fn prune_runs(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    Query(params): Query<PruneParams>,
+) -> Result<Response, ApiError> {
+    if !peer.ip().is_loopback() {
+        return Ok(loopback_only("run prune"));
+    }
+    let removed = state.runs.prune(params.cutoff).await?;
+    Ok(Json(json!({ "removed": removed })).into_response())
+}
+
+/// Delete every session with no messages (backs `shion session clean`).
+async fn clean_sessions(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+) -> Result<Response, ApiError> {
+    if !peer.ip().is_loopback() {
+        return Ok(loopback_only("session clean"));
+    }
+    let removed = state.sessions.delete_empty_sessions().await?;
+    Ok(Json(json!({ "removed": removed })).into_response())
+}
+
+#[derive(Deserialize)]
+struct ApproveParams {
+    code: String,
+}
+
+/// Approve the pending pairing bearing `code` (backs `shion pair approve`). The
+/// outcome variant is echoed so the CLI prints the same message it would locally.
+async fn pair_approve(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    Json(body): Json<ApproveParams>,
+) -> Result<Response, ApiError> {
+    if !peer.ip().is_loopback() {
+        return Ok(loopback_only("pair approve"));
+    }
+    let json = match state.pairings.approve_code(&body.code).await? {
+        ApproveOutcome::Approved(request) => json!({ "outcome": "approved", "id": request.id }),
+        ApproveOutcome::NotFound => json!({ "outcome": "not_found" }),
+        ApproveOutcome::Locked { retry_after_secs } => {
+            json!({ "outcome": "locked", "retry_after_secs": retry_after_secs })
+        }
+    };
+    Ok(Json(json).into_response())
+}
+
+/// Remove a pairing by id (backs `shion pair revoke`).
+async fn pair_revoke(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    Path(id): Path<String>,
+) -> Result<Response, ApiError> {
+    if !peer.ip().is_loopback() {
+        return Ok(loopback_only("pair revoke"));
+    }
+    let revoked = state.pairings.revoke(&id).await?;
+    Ok(Json(json!({ "revoked": revoked })).into_response())
+}
+
+/// Run one dreaming consolidation cycle (backs `shion dream --apply`) — the same
+/// `DreamSweep` the gateway schedules.
+async fn dream_apply(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+) -> Result<Response, ApiError> {
+    if !peer.ip().is_loopback() {
+        return Ok(loopback_only("dream --apply"));
+    }
+    let summary = DreamSweep {
+        memories: state.memories.clone(),
+    }
+    .apply()
+    .await?;
+    Ok(Json(json!({
+        "promoted": summary.memories_promoted,
+        "archived": summary.memories_archived,
+    }))
     .into_response())
 }
 

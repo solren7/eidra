@@ -4,7 +4,7 @@
 //! runtime. They are the operator's view into what the gateway will act on.
 
 use crate::{
-    cli::gateway_client::{GatewayClient, refuse_if_gateway_running},
+    cli::gateway_client::GatewayClient,
     domain::{
         reminder::ReminderRepository,
         repository::SessionRepository,
@@ -195,6 +195,12 @@ pub async fn run_inspect(db_url: &str, id: &str) -> anyhow::Result<()> {
 pub async fn run_prune(db_url: &str, cutoff: i64) -> anyhow::Result<()> {
     let db = Db::connect(db_url).await?;
     let removed = RunRepository::prune(&db, cutoff).await?;
+    report_prune(removed, cutoff);
+    Ok(())
+}
+
+/// Print the prune outcome (shared by the direct-db and gateway-routed paths).
+pub fn report_prune(removed: usize, cutoff: i64) {
     if removed == 0 {
         println!("No runs older than {}; nothing pruned.", local_time(cutoff));
     } else {
@@ -203,7 +209,6 @@ pub async fn run_prune(db_url: &str, cutoff: i64) -> anyhow::Result<()> {
             local_time(cutoff)
         );
     }
-    Ok(())
 }
 
 /// Resolve the `--keep N` form to a cutoff timestamp: keep the N most recent
@@ -284,9 +289,14 @@ pub async fn session_list(db_url: &str) -> anyhow::Result<()> {
 /// Delete every session with zero messages. An operator action — run it by
 /// hand or from an external scheduler (launchd/cron), e.g. daily at 4am.
 pub async fn session_clean(db_url: &str) -> anyhow::Result<()> {
-    refuse_if_gateway_running("session clean").await?;
-    let db = Db::connect(db_url).await?;
-    let removed = SessionRepository::delete_empty_sessions(&db).await?;
+    // Route through a running gateway (which holds the db lock) when up.
+    let removed = match GatewayClient::try_connect().await {
+        Some(gw) => gw.clean_sessions().await?,
+        None => {
+            let db = Db::connect(db_url).await?;
+            SessionRepository::delete_empty_sessions(&db).await?
+        }
+    };
     println!("Removed {removed} empty session(s).");
     Ok(())
 }

@@ -101,11 +101,14 @@ types verbatim so the CLI reuses its renderers. Memory governance writes
 (`memory promote/reject/pin/triage`) route to loopback-gated
 `POST /api/memories/{id}/promote|reject|pin` (the transition semantics live on
 `Memory::promote/reject/pin` so CLI, api, and the `memory` tool share one
-definition). Write commands not yet routed (`run prune`, `session clean`,
-`pair approve/revoke`, `dream --apply`) print a "gateway holds the lock — stop
-it, or do it from chat" message (`refuse_if_gateway_running`) instead of the
-raw Turso error; pairing admission while the gateway runs is the `/pair` chat
-command. The api channel is
+definition). The maintenance **write** commands route too, to loopback-gated
+endpoints: `run prune` → `POST /api/runs/prune?cutoff=` (the `--keep N` cutoff
+is resolved client-side from `GET /api/runs`), `session clean` →
+`POST /api/sessions/clean`, `pair approve/revoke` →
+`POST /api/pairings/approve|/{id}/revoke`, `dream --apply` →
+`POST /api/dream/apply` (runs the same `DreamSweep`). Each falls back to opening
+the db directly when no gateway is up, so there is no longer a "stop the gateway
+first" refusal (`/pair approve` in chat remains the other in-gateway path). The api channel is
 loopback-only on an ephemeral port by default; `[channels.api] enabled = true`
 widens it to an external bind/port (requires `API_SERVER_KEY`) for Open WebUI /
 the dashboard.

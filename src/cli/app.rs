@@ -459,19 +459,35 @@ pub async fn run() -> anyhow::Result<()> {
 /// then prune. Exactly one of the two must be given (clap enforces mutual
 /// exclusion, but not presence).
 async fn run_prune(db: &str, before: Option<String>, keep: Option<usize>) -> anyhow::Result<()> {
-    crate::cli::gateway_client::refuse_if_gateway_running("run prune").await?;
+    // Route through a running gateway (which holds the db lock) when one is up,
+    // else open the db directly. The `--keep N` cutoff needs the run list, which
+    // also comes from the gateway when routed.
+    let gw = crate::cli::gateway_client::GatewayClient::try_connect().await;
     let cutoff = match (before, keep) {
         (Some(date), None) => parse_local_date(&date)?,
-        (None, Some(keep)) => match inspect::run_keep_cutoff(db, keep).await? {
-            Some(cutoff) => cutoff,
-            None => {
-                println!("Fewer than {} runs; nothing to prune.", keep + 1);
-                return Ok(());
+        (None, Some(keep)) => {
+            let cutoff = match &gw {
+                Some(gw) => gw.runs(keep + 1).await?.get(keep).map(|r| r.started_at),
+                None => inspect::run_keep_cutoff(db, keep).await?,
+            };
+            match cutoff {
+                Some(cutoff) => cutoff,
+                None => {
+                    println!("Fewer than {} runs; nothing to prune.", keep + 1);
+                    return Ok(());
+                }
             }
-        },
+        }
         _ => anyhow::bail!("pass exactly one of --before <YYYY-MM-DD> or --keep <N>"),
     };
-    inspect::run_prune(db, cutoff).await
+    match &gw {
+        Some(gw) => {
+            let removed = gw.prune_runs(cutoff).await?;
+            inspect::report_prune(removed, cutoff);
+            Ok(())
+        }
+        None => inspect::run_prune(db, cutoff).await,
+    }
 }
 
 /// Parse a `YYYY-MM-DD` date as local-time midnight, returning a unix timestamp.

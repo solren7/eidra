@@ -40,6 +40,14 @@ pub struct GatewayClient {
     http: reqwest::Client,
 }
 
+/// Result of a gateway-routed `pair approve`, mirroring the db path's
+/// `ApproveOutcome` so the CLI prints the same message either way.
+pub enum PairApprove {
+    Approved(String),
+    NotFound,
+    Locked(i64),
+}
+
 impl GatewayClient {
     /// Reachable gateway → `Some`; no rendezvous file, unparseable, or the probe
     /// fails (stale file / crashed gateway) → `None` (caller falls back to db).
@@ -214,6 +222,103 @@ impl GatewayClient {
         Ok(())
     }
 
+    /// POST a loopback-gated control-plane write and pull one field out of the
+    /// `{ "<field>": T }` reply. Shared by the maintenance write routes below.
+    async fn post_field<T: DeserializeOwned>(
+        &self,
+        path: &str,
+        body: Value,
+        field: &str,
+    ) -> anyhow::Result<T> {
+        let mut map: Map<String, Value> = self
+            .http
+            .post(self.url(path))
+            .bearer_auth(&self.key)
+            .json(&body)
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        let val = map
+            .remove(field)
+            .with_context(|| format!("gateway response missing `{field}`"))?;
+        Ok(serde_json::from_value(val)?)
+    }
+
+    /// Prune runs started before `cutoff` server-side; returns the count removed.
+    pub async fn prune_runs(&self, cutoff: i64) -> anyhow::Result<usize> {
+        self.post_field(
+            &format!("/api/runs/prune?cutoff={cutoff}"),
+            json!({}),
+            "removed",
+        )
+        .await
+    }
+
+    /// Delete empty sessions server-side; returns the count removed.
+    pub async fn clean_sessions(&self) -> anyhow::Result<usize> {
+        self.post_field("/api/sessions/clean", json!({}), "removed")
+            .await
+    }
+
+    /// Approve a pending pairing by code server-side.
+    pub async fn pair_approve(&self, code: &str) -> anyhow::Result<PairApprove> {
+        let v: Value = self
+            .http
+            .post(self.url("/api/pairings/approve"))
+            .bearer_auth(&self.key)
+            .json(&json!({ "code": code }))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        match v.get("outcome").and_then(|o| o.as_str()) {
+            Some("approved") => Ok(PairApprove::Approved(
+                v.get("id")
+                    .and_then(|i| i.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+            )),
+            Some("locked") => Ok(PairApprove::Locked(
+                v.get("retry_after_secs")
+                    .and_then(|s| s.as_i64())
+                    .unwrap_or(0),
+            )),
+            _ => Ok(PairApprove::NotFound),
+        }
+    }
+
+    /// Revoke a pairing by id server-side; returns whether a row was removed.
+    pub async fn pair_revoke(&self, id: &str) -> anyhow::Result<bool> {
+        self.post_field(&format!("/api/pairings/{id}/revoke"), json!({}), "revoked")
+            .await
+    }
+
+    /// Run one dreaming consolidation cycle server-side; returns
+    /// `(promoted, archived)` counts.
+    pub async fn dream_apply(&self) -> anyhow::Result<(usize, usize)> {
+        let mut map: Map<String, Value> = self
+            .http
+            .post(self.url("/api/dream/apply"))
+            .bearer_auth(&self.key)
+            .json(&json!({}))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        let take = |m: &mut Map<String, Value>, k: &str| -> anyhow::Result<usize> {
+            Ok(serde_json::from_value(
+                m.remove(k).unwrap_or(Value::from(0)),
+            )?)
+        };
+        let promoted = take(&mut map, "promoted")?;
+        let archived = take(&mut map, "archived")?;
+        Ok((promoted, archived))
+    }
+
     /// Run one chat turn server-side and return the reply. Sends the stable
     /// session id (so history threads) and the trusted marker (so the gateway
     /// auto-approves side-effecting tools — it is gated to loopback callers).
@@ -241,20 +346,6 @@ impl GatewayClient {
             .to_string();
         Ok(reply)
     }
-}
-
-/// Guard for a write-path CLI command not yet routed through the gateway (v1
-/// routes reads + chat). If a gateway is running it holds the exclusive db lock,
-/// so the command can't open the db — return a clear message instead of letting
-/// the raw Turso lock error surface.
-pub async fn refuse_if_gateway_running(action: &str) -> anyhow::Result<()> {
-    if GatewayClient::try_connect().await.is_some() {
-        anyhow::bail!(
-            "the gateway is running and holds the db lock, so `{action}` can't open it.\n\
-             Stop it with `shion gateway stop` to run this (or do it from chat where supported, e.g. `/pair …`)."
-        );
-    }
-    Ok(())
 }
 
 #[cfg(test)]

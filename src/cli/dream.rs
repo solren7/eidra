@@ -11,7 +11,7 @@
 //! one is up; `--apply` mutates the db, so it requires the gateway stopped.
 
 use crate::agent::daemon::DreamSweep;
-use crate::cli::gateway_client::{GatewayClient, refuse_if_gateway_running};
+use crate::cli::gateway_client::GatewayClient;
 use crate::domain::memory::{DreamVerdict, MemoryRepository, dream_score, dream_verdict};
 use crate::infra::memory::memory_db::MemoryDb;
 use crate::infra::messaging::api::DreamItem;
@@ -19,21 +19,14 @@ use std::sync::Arc;
 
 /// Run a dreaming cycle, or preview one. `apply = false` mutates nothing.
 pub async fn run(url: &str, apply: bool) -> anyhow::Result<()> {
-    // Applying mutates the db — refuse while the gateway owns the lock.
-    if apply {
-        refuse_if_gateway_running("dream --apply").await?;
-    }
     let now = time::OffsetDateTime::now_utc().unix_timestamp();
 
-    // The preview can route to a running gateway; the apply path is only reached
-    // with the gateway down (guarded above), so it always classifies locally.
-    let (promote, archive) = if !apply {
-        match GatewayClient::try_connect().await {
-            Some(gw) => gw.dream_preview().await?,
-            None => classify_local(url, now).await?,
-        }
-    } else {
-        classify_local(url, now).await?
+    // Both preview and apply route through a running gateway (which holds the db
+    // lock) when one is up, else open the db directly.
+    let gw = GatewayClient::try_connect().await;
+    let (promote, archive) = match &gw {
+        Some(gw) => gw.dream_preview().await?,
+        None => classify_local(url, now).await?,
     };
 
     if promote.is_empty() && archive.is_empty() {
@@ -49,12 +42,15 @@ pub async fn run(url: &str, apply: bool) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    let db = Arc::new(MemoryDb::connect(url).await?);
-    let summary = DreamSweep { memories: db }.apply().await?;
-    println!(
-        "\nApplied: promoted {}, archived {}.",
-        summary.memories_promoted, summary.memories_archived
-    );
+    let (promoted, archived) = match &gw {
+        Some(gw) => gw.dream_apply().await?,
+        None => {
+            let db = Arc::new(MemoryDb::connect(url).await?);
+            let summary = DreamSweep { memories: db }.apply().await?;
+            (summary.memories_promoted, summary.memories_archived)
+        }
+    };
+    println!("\nApplied: promoted {promoted}, archived {archived}.");
     Ok(())
 }
 
