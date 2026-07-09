@@ -6,8 +6,8 @@ edition = "2024"
 [dependencies]
 clap = { version = "4.6.1", features = ["derive"] }
 tokio = { version = "1.52.0", features = ["full"] }
-toasty = { version = "0.7.0", features = ["sqlite", "turso"] }
-toasty-driver-turso = "0.7.0"
+toasty = { version = "0.8.0", features = ["sqlite", "turso"] }
+toasty-driver-turso = "0.8.0"
 # Direct handle to the same Turso engine toasty uses, for the one thing toasty's
 # typed API can't do: run a raw `ALTER TABLE ADD COLUMN` to migrate an existing
 # memory.db in place (additive, no data loss). See `memory_db::ensure_columns`.
