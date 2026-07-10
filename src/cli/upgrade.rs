@@ -14,13 +14,29 @@
 //!      Docker/Linux deployments should restart the container/process outside
 //!      shion after upgrading.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use super::service;
 
 pub fn run(no_restart: bool) -> anyhow::Result<()> {
-    let repo = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let baked = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    // A binary installed from a *linked* git worktree (e.g. a coding-agent
+    // session worktree under `.claude/worktrees/`) bakes that worktree's path.
+    // Upgrading there would pull a stale topic branch — or fail outright, since
+    // such branches have no upstream. Redirect to the repository's main
+    // worktree, which is where `main` lives.
+    let repo = match main_worktree_of(&baked) {
+        Some(main) if main != baked => {
+            println!(
+                "(built from the linked worktree {} — upgrading from the main \
+                 checkout instead)",
+                baked.display()
+            );
+            main
+        }
+        _ => baked,
+    };
     if !repo.exists() {
         anyhow::bail!(
             "source repo {} no longer exists — `shion upgrade` rebuilds from the \
@@ -108,4 +124,93 @@ fn cargo_root_for_current_exe() -> Option<PathBuf> {
         return None;
     }
     Some(bin_dir.parent()?.to_path_buf())
+}
+
+/// The repository's **main** worktree for a checkout at `repo`: a linked
+/// worktree's `--git-common-dir` is `<main>/.git`, so the main worktree is its
+/// parent (for the main worktree itself this resolves back to `repo`). `None`
+/// when `repo` isn't a git checkout git can describe (also bare repos, whose
+/// common dir isn't named `.git`) — the caller then keeps the baked path and
+/// the existing "not a git repo" handling applies.
+fn main_worktree_of(repo: &Path) -> Option<PathBuf> {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["rev-parse", "--path-format=absolute", "--git-common-dir"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let common = PathBuf::from(String::from_utf8(out.stdout).ok()?.trim());
+    if common.file_name()? != ".git" {
+        return None;
+    }
+    Some(common.parent()?.to_path_buf())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `git` is a build requirement already (skill installs shell out to it),
+    /// so the test exercises the real resolution: a linked worktree resolves
+    /// to the main checkout, and the main checkout resolves to itself.
+    #[test]
+    fn main_worktree_resolves_linked_worktrees_to_the_main_checkout() {
+        let dir = std::env::temp_dir().join("shion_upgrade_worktree_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        let main = dir.join("repo");
+        std::fs::create_dir_all(&main).unwrap();
+        let git = |args: &[&str], cwd: &Path| {
+            let ok = Command::new("git")
+                .arg("-C")
+                .arg(cwd)
+                .args(args)
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@t")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@t")
+                .output()
+                .unwrap()
+                .status
+                .success();
+            assert!(ok, "git {args:?} failed");
+        };
+        git(&["init", "-q"], &main);
+        std::fs::write(main.join("x"), "x").unwrap();
+        git(&["add", "."], &main);
+        git(&["commit", "-qm", "init"], &main);
+        let linked = dir.join("linked");
+        git(
+            &[
+                "worktree",
+                "add",
+                "-q",
+                linked.to_str().unwrap(),
+                "-b",
+                "topic",
+            ],
+            &main,
+        );
+
+        let resolved = main_worktree_of(&linked).expect("linked worktree resolves");
+        assert_eq!(
+            resolved.canonicalize().unwrap(),
+            main.canonicalize().unwrap()
+        );
+        let same = main_worktree_of(&main).expect("main worktree resolves");
+        assert_eq!(same.canonicalize().unwrap(), main.canonicalize().unwrap());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn main_worktree_is_none_outside_a_repo() {
+        let dir = std::env::temp_dir().join("shion_upgrade_nonrepo_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(main_worktree_of(&dir).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
