@@ -12,20 +12,16 @@
 //! paths fail fast via [`ConfigSnapshot::validate_agent`] /
 //! [`ConfigSnapshot::validate_gateway`].
 
-pub mod report;
-pub mod resolved;
-pub mod sources;
+mod report;
+mod resolved;
+mod sources;
 mod write;
 
 use std::path::PathBuf;
 
-pub use report::{ConfigIssue, ConfigReport, IssueSeverity, Origin};
-pub use resolved::{
-    ApiConfig, ChannelState, DEFAULT_DREAM_SCHEDULE, DEFAULT_MAX_HISTORY_MESSAGES,
-    DEFAULT_MAX_TOOL_RESULT_BYTES, DEFAULT_MAX_TURNS, FeishuConfig, HomeAssistantChannelConfig,
-    HomeAssistantConfig, ModelConfig, PolicyReport, RuntimeConfig, TelegramConfig, WeChatConfig,
-};
-pub use sources::{ConfigSources, FileConfig, Secrets, ShionEnv};
+pub use report::*;
+pub use resolved::*;
+pub use sources::ConfigSources;
 pub use write::write_model_selection;
 
 /// Supported LLM providers (all OpenAI-compatible or natively wired in `rig`).
@@ -138,23 +134,21 @@ impl ConfigSnapshot {
     /// `SHION_*` env or an unusable model selection. Channel problems don't
     /// block a chat turn — the gateway checks those via [`Self::validate_gateway`].
     pub fn validate_agent(&self) -> anyhow::Result<()> {
-        self.first_fatal(|issue| issue.path == "env" || issue.path.starts_with("model"))
+        Self::ok_or(
+            self.report
+                .fatal_matching(|i| i.path == "env" || i.path.starts_with("model")),
+        )
     }
 
     /// Fail on *any* fatal issue — the gateway hosts every surface, so an
     /// enabled-but-misconfigured channel must stop startup, matching the old
     /// per-resolver fail-fast behavior.
     pub fn validate_gateway(&self) -> anyhow::Result<()> {
-        self.first_fatal(|_| true)
+        Self::ok_or(self.report.fatal())
     }
 
-    fn first_fatal(&self, relevant: impl Fn(&ConfigIssue) -> bool) -> anyhow::Result<()> {
-        match self
-            .report
-            .issues
-            .iter()
-            .find(|i| i.severity == IssueSeverity::Fatal && relevant(i))
-        {
+    fn ok_or(fatal: Option<&ConfigIssue>) -> anyhow::Result<()> {
+        match fatal {
             Some(issue) => Err(anyhow::anyhow!("{}", issue.message)),
             None => Ok(()),
         }
@@ -200,40 +194,13 @@ pub fn ensure_shion_home() -> PathBuf {
             let _ = std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o700));
         }
         let env_path = home.join(".env");
-        if let Ok(meta) = std::fs::metadata(&env_path) {
-            if meta.permissions().mode() & 0o777 != 0o600 {
-                let _ = std::fs::set_permissions(&env_path, std::fs::Permissions::from_mode(0o600));
-            }
+        if let Ok(meta) = std::fs::metadata(&env_path)
+            && meta.permissions().mode() & 0o777 != 0o600
+        {
+            let _ = std::fs::set_permissions(&env_path, std::fs::Permissions::from_mode(0o600));
         }
     }
     home
-}
-
-/// `turso:<shion_home>/<file>` (Turso engine). Creates the config directory on
-/// first use so the engine can create the database file.
-fn db_url(file: &str) -> String {
-    format!("turso:{}", ensure_shion_home().join(file).display())
-}
-
-/// Default database URL: `turso:<shion_home>/shion.db` (Turso engine).
-/// Holds disposable state (sessions, messages, session todos, pairings,
-/// reminders, skills, settings) — deletable to reset.
-pub fn default_db_url() -> String {
-    db_url("shion.db")
-}
-
-/// Kanban database URL: `turso:<shion_home>/kanban.db`. Durable cross-session
-/// tasks live here, separate from `shion.db` so resetting the latter never
-/// wipes real task data.
-pub fn default_kanban_db_url() -> String {
-    db_url("kanban.db")
-}
-
-/// Memory database URL: `turso:<shion_home>/memory.db`. Durable long-term
-/// memories live here, separate from `shion.db` (like `kanban.db`) so resetting
-/// the session db never wipes real personal data.
-pub fn default_memory_db_url() -> String {
-    db_url("memory.db")
 }
 
 /// Directory holding the cached Chinese workday calendar, one `{year}.json` per
@@ -247,97 +214,6 @@ pub fn workday_cache_dir() -> PathBuf {
 /// channel and the `shion channel wechat login` provisioning command.
 pub fn wechat_cred_path() -> PathBuf {
     shion_home().join("wechat").join("credentials.json")
-}
-
-// ---------------------------------------------------------------------------
-// Legacy per-field resolvers. Thin shims over one ConfigSnapshot load, kept
-// only while callers migrate to consuming the snapshot directly (architecture
-// deepening plan, Phase A). Do not add callers.
-// ---------------------------------------------------------------------------
-
-/// Maintenance cron schedule: `SHION_SCHEDULE` env > config.toml `schedule`
-/// > hourly default.
-pub fn maintenance_schedule() -> String {
-    ConfigSnapshot::load().runtime.maintenance_schedule
-}
-
-/// Daily-briefing cron schedule: `SHION_BRIEFING_SCHEDULE` env >
-/// config.toml `briefing_schedule`. Opt-in (no default).
-pub fn briefing_schedule() -> Option<String> {
-    ConfigSnapshot::load().runtime.briefing_schedule
-}
-
-/// Whether the daily briefing should only fire on Chinese working days.
-pub fn briefing_workdays_only() -> bool {
-    ConfigSnapshot::load().runtime.briefing_workdays_only
-}
-
-/// Dreaming-sweep cron schedule; `None` means disabled.
-pub fn dream_schedule() -> Option<String> {
-    ConfigSnapshot::load().runtime.dream_schedule
-}
-
-/// Resolve the permission policy from `~/.shion/config.toml`.
-pub fn policy_config() -> crate::domain::policy::Policy {
-    ConfigSnapshot::load().runtime.policy.policy
-}
-
-/// [`policy_config`] with load diagnostics.
-pub fn policy_report() -> PolicyReport {
-    ConfigSnapshot::load().runtime.policy
-}
-
-/// Resolve the Home Assistant tool config from the environment.
-pub fn homeassistant_config() -> Option<HomeAssistantConfig> {
-    ConfigSnapshot::load().runtime.homeassistant_tool
-}
-
-/// Resolve the Home Assistant ingress channel.
-pub fn homeassistant_channel_config() -> anyhow::Result<Option<HomeAssistantChannelConfig>> {
-    ConfigSnapshot::load()
-        .runtime
-        .homeassistant_channel
-        .into_result()
-}
-
-/// Resolve the Feishu channel config.
-pub fn feishu_config() -> anyhow::Result<Option<FeishuConfig>> {
-    ConfigSnapshot::load().runtime.feishu.into_result()
-}
-
-/// Resolve the Telegram channel config.
-pub fn telegram_config() -> anyhow::Result<Option<TelegramConfig>> {
-    ConfigSnapshot::load().runtime.telegram.into_result()
-}
-
-/// Resolve the WeChat channel config.
-pub fn wechat_config() -> anyhow::Result<Option<WeChatConfig>> {
-    ConfigSnapshot::load().runtime.wechat.into_result()
-}
-
-/// Resolve the (always-on) HTTP API channel config.
-pub fn api_config() -> anyhow::Result<ApiConfig> {
-    match ConfigSnapshot::load().runtime.api {
-        ChannelState::Ready(cfg) => Ok(cfg),
-        ChannelState::Misconfigured(msg) => Err(anyhow::anyhow!(msg)),
-        ChannelState::Disabled => unreachable!("the api channel is always on"),
-    }
-}
-
-impl ModelConfig {
-    /// Resolve configuration with three-layer priority (lowest → highest):
-    /// built-in defaults < `~/.shion/config.toml` < `SHION_*` env vars.
-    /// Errors on the issues that would make an agent turn impossible.
-    pub fn resolve() -> anyhow::Result<Self> {
-        let snapshot = ConfigSnapshot::load();
-        snapshot.validate_agent()?;
-        Ok(snapshot.runtime.model)
-    }
-
-    /// Backward-compatible alias for `resolve()`.
-    pub fn from_env() -> anyhow::Result<Self> {
-        Self::resolve()
-    }
 }
 
 #[cfg(test)]

@@ -58,9 +58,15 @@ pub struct ConfigReport {
 impl ConfigReport {
     /// The first fatal issue, if any.
     pub fn fatal(&self) -> Option<&ConfigIssue> {
+        self.fatal_matching(|_| true)
+    }
+
+    /// The first fatal issue a caller cares about (e.g. only model/env issues
+    /// for an agent turn, everything for gateway startup).
+    pub fn fatal_matching(&self, relevant: impl Fn(&ConfigIssue) -> bool) -> Option<&ConfigIssue> {
         self.issues
             .iter()
-            .find(|i| i.severity == IssueSeverity::Fatal)
+            .find(|i| i.severity == IssueSeverity::Fatal && relevant(i))
     }
 
     /// Whether `provider`'s env API key is present (always `false` for Codex —

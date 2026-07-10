@@ -164,11 +164,22 @@ watch_all = false            # forward every entity (overrides the watch lists)
 cooldown_seconds = 30        # per-entity min seconds between forwarded events
 ```
 
-Env management: dotenvy loads `.env` files into the process env (`main.rs`); envy
-deserializes them into typed structs in `config.rs` (`ShionEnv` for `SHION_*`,
-`ApiKeys` for provider keys, `FeishuEnv` for `FEISHU_*`, `TelegramEnv` for
-`TELEGRAM_*`). Read env vars through those structs, not `std::env::var` — the
-only exception is `SHION_HOME`, the bootstrap variable that locates `.env` itself.
+Config resolution: `src/config/` resolves everything **once** into a
+`ConfigSnapshot { runtime: RuntimeConfig, report: ConfigReport }`.
+`sources.rs` reads the three raw sources one time (dotenvy loads `.env` into
+the process env in `main.rs`; envy deserializes `ShionEnv` for `SHION_*` and
+`Secrets` for every credential; `FileConfig` parses config.toml) and
+`resolved.rs` applies precedence/defaults purely — `from_sources` is the test
+seam, so resolution tests never touch the real env. Resolution **never
+aborts**: problems become `ConfigIssue`s in the report (with per-value
+provenance, secrets redacted to presence-only), and startup paths fail fast via
+`validate_agent` (env/model issues — wiring calls it) or `validate_gateway`
+(any fatal issue, e.g. an enabled channel missing its credential —
+`gateway::run` calls it). `cli/app.rs` loads the snapshot once per invocation
+and threads `&ConfigSnapshot` to chat/gateway/doctor/model/policy; channel
+tri-state (disabled / ready / misconfigured) is `ChannelState<T>`. Never
+re-read config.toml or call `std::env::var` in callers — the only exception is
+`SHION_HOME`, the bootstrap variable that locates `.env` itself.
 
 Channel declarations follow hermes-agent's per-platform block shape — behavior
 keys in the table, credentials in env:

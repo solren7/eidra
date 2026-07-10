@@ -79,15 +79,6 @@ impl ShionEnv {
         Ok(env.normalized())
     }
 
-    /// Lenient load for paths that must not abort: warns on stderr and
-    /// drops all `SHION_*` overrides when any value is malformed.
-    pub fn load_lenient() -> Self {
-        Self::load().unwrap_or_else(|e| {
-            eprintln!("shion: {e} (ignoring SHION_* overrides)");
-            Self::default()
-        })
-    }
-
     /// Treat empty strings as unset, so `SHION_MODEL=` behaves like an
     /// absent variable.
     fn normalized(mut self) -> Self {

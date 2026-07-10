@@ -114,16 +114,6 @@ impl<T> ChannelState<T> {
             _ => None,
         }
     }
-
-    /// Legacy `*_config()` shape: disabled → `Ok(None)`, ready → `Ok(Some)`,
-    /// misconfigured → `Err` (the old fail-fast startup semantics).
-    pub fn into_result(self) -> anyhow::Result<Option<T>> {
-        match self {
-            ChannelState::Disabled => Ok(None),
-            ChannelState::Ready(cfg) => Ok(Some(cfg)),
-            ChannelState::Misconfigured(msg) => Err(anyhow::anyhow!(msg)),
-        }
-    }
 }
 
 /// Resolved model selection: provider, model id, API key, and optional overrides.
