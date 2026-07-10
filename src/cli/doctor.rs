@@ -15,9 +15,9 @@
 //! CLI read path: a reachable gateway → `GET /api/*` (it holds the exclusive
 //! db lock); none → open the db directly.
 
-use crate::cli::gateway_client::GatewayClient;
 use crate::config::{ChannelState, ConfigSnapshot, IssueSeverity, wechat_cred_path};
 use crate::domain::{home::HomeRepository, run::RunRepository};
+use crate::infra::gateway_client::GatewayClient;
 use crate::infra::persistence::db::Db;
 use crate::infra::rendezvous;
 

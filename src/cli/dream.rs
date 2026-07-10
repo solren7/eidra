@@ -11,8 +11,8 @@
 //! one is up; `--apply` mutates the db, so it requires the gateway stopped.
 
 use crate::agent::daemon::DreamSweep;
-use crate::cli::gateway_client::GatewayClient;
 use crate::domain::memory::MemoryRepository;
+use crate::infra::gateway_client::GatewayClient;
 use crate::infra::memory::memory_db::MemoryDb;
 use crate::services::operator_control::{DreamItem, DreamReport, actions::dream_classify};
 use std::sync::Arc;

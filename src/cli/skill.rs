@@ -7,8 +7,9 @@
 //! effect on its next `skill` list — no gateway restart.
 
 use crate::{
-    cli::{gateway_client::GatewayClient, inspect::local_time},
+    cli::inspect::local_time,
     domain::run::RunRepository,
+    infra::gateway_client::GatewayClient,
     infra::{persistence::db::Db, skills::FsSkillStore},
     services::operator_control::actions::skill_invocations,
 };

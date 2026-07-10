@@ -4,8 +4,8 @@
 //! host-side operator view: it lists and searches across *all* scopes, so you
 //! can triage candidates the reviewer captured and promote/pin the durable ones.
 
-use crate::cli::gateway_client::GatewayClient;
 use crate::domain::memory::{Memory, MemoryConfidence, MemoryRepository, MemoryStatus};
+use crate::infra::gateway_client::GatewayClient;
 use crate::infra::memory::memory_db::MemoryDb;
 
 async fn store(url: &str) -> anyhow::Result<MemoryDb> {

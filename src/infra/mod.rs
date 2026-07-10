@@ -1,5 +1,6 @@
 // Cross-cutting infra (LLM backend, Codex OAuth, tool adapter, workday calendar)
 pub mod codex;
+pub mod gateway_client;
 pub mod llm;
 pub mod rendezvous;
 pub mod rig_tool;

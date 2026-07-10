@@ -9,7 +9,7 @@
 //! graceful shutdown.
 //!
 //! The file is only a hint — a crashed gateway leaves a stale file behind, so
-//! callers always probe `/health` (see [`crate::cli::gateway_client`]) rather
+//! callers always probe `/health` (see [`crate::infra::gateway_client`]) rather
 //! than trusting the file's mere existence. The bearer key lives here (mode
 //! `0600`) so the CLI need not re-derive the auto-generated loopback key from
 //! anywhere else.

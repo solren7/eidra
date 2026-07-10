@@ -3,7 +3,6 @@ mod approver;
 mod doctor;
 mod dream;
 mod gateway;
-pub(crate) mod gateway_client;
 mod inspect;
 mod journey;
 mod logs;

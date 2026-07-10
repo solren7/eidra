@@ -26,10 +26,13 @@ use tokio::sync::mpsc;
 
 use crate::{
     agent::runtime::AgentRuntime,
-    cli::{gateway_client::GatewayClient, wiring},
+    cli::wiring,
     config::ConfigSnapshot,
     domain::{approval::Approver, repository::SessionRepository, session::Session},
-    infra::persistence::{db::Db, kanban::KanbanDb},
+    infra::{
+        gateway_client::GatewayClient,
+        persistence::{db::Db, kanban::KanbanDb},
+    },
 };
 
 use app::{Action, App, Role};

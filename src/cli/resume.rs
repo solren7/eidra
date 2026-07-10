@@ -9,12 +9,13 @@
 use std::sync::Arc;
 
 use crate::{
-    cli::{approver::CliApprover, gateway_client::GatewayClient, wiring},
+    cli::{approver::CliApprover, wiring},
     config::ConfigSnapshot,
     domain::{
         approval::Approver,
         run::{Run, RunRepository, resume_prompt},
     },
+    infra::gateway_client::GatewayClient,
     infra::persistence::{db::Db, kanban::KanbanDb},
 };
 

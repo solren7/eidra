@@ -4,10 +4,372 @@
 //! Turso's exclusive cross-process lock means a running gateway is the sole
 //! owner of the dbs — so every operator action has two transports: routed to
 //! the gateway over its loopback api channel, or executed in-process against
-//! directly-opened stores. This module hides that choice; CLI callers never
-//! probe the gateway or pick a db themselves.
+//! directly-opened stores. [`OperatorControl`] hides that choice: CLI callers
+//! issue one typed [`OperatorQuery`]/[`OperatorCommand`] and never probe the
+//! gateway, pick a db, or translate transport payloads themselves.
+//!
+//! The two adapters may differ only in transport, auth, and connection
+//! ownership — the business result comes from the shared projections and
+//! transitions in [`actions`], which the gateway's HTTP handlers call too.
 
 pub mod actions;
+mod direct;
+mod gateway;
 pub mod request;
 
+use std::future::Future;
+use std::sync::Arc;
+
 pub use request::*;
+
+use crate::config::RuntimeConfig;
+use crate::domain::run::RunRepository;
+use crate::infra::gateway_client::GatewayClient;
+use crate::infra::persistence::{db::Db, kanban::KanbanDb};
+
+use direct::DirectOperatorAdapter;
+use gateway::GatewayOperatorAdapter;
+
+/// Where the three stores live, for the direct adapter's lazy connections.
+#[derive(Debug, Clone)]
+pub struct StoreUrls {
+    pub db: String,
+    pub kanban: String,
+    pub memory: String,
+}
+
+impl StoreUrls {
+    pub fn from_config(runtime: &RuntimeConfig) -> Self {
+        Self {
+            db: runtime.db_url.clone(),
+            kanban: runtime.kanban_db_url.clone(),
+            memory: runtime.memory_db_url.clone(),
+        }
+    }
+}
+
+enum OperatorBackend {
+    Gateway(GatewayOperatorAdapter),
+    Direct(DirectOperatorAdapter),
+}
+
+/// The operator surface's single entry point. Resolve once per CLI command
+/// (`connect` probes the gateway exactly once), then issue any number of
+/// queries/commands against the same backend — a batch never re-probes or
+/// reconnects per item.
+pub struct OperatorControl {
+    backend: OperatorBackend,
+}
+
+impl OperatorControl {
+    /// Probe for a running gateway once: reachable → route over its loopback
+    /// api channel; otherwise operate on the stores directly (opened lazily,
+    /// only the ones a request actually needs).
+    pub async fn connect(urls: StoreUrls) -> anyhow::Result<Self> {
+        let backend = match GatewayClient::try_connect().await {
+            Some(client) => OperatorBackend::Gateway(GatewayOperatorAdapter::new(client)),
+            None => OperatorBackend::Direct(DirectOperatorAdapter::new(urls)),
+        };
+        Ok(Self { backend })
+    }
+
+    /// Whether actions route to a running gateway (status lines only — never
+    /// branch behavior on this).
+    pub fn via_gateway(&self) -> bool {
+        matches!(self.backend, OperatorBackend::Gateway(_))
+    }
+
+    /// Run one read-only operator query.
+    pub async fn query(&self, query: OperatorQuery) -> anyhow::Result<OperatorQueryResult> {
+        match &self.backend {
+            OperatorBackend::Gateway(gw) => gw.query(query).await,
+            OperatorBackend::Direct(direct) => direct.query(query).await,
+        }
+    }
+
+    /// Run one state-changing operator command.
+    pub async fn command(&self, command: OperatorCommand) -> anyhow::Result<OperatorCommandResult> {
+        match &self.backend {
+            OperatorBackend::Gateway(gw) => gw.command(command).await,
+            OperatorBackend::Direct(direct) => direct.command(command).await,
+        }
+    }
+
+    /// Resume an interrupted run. `id = None` picks the most recent recoverable
+    /// run (same scan on both backends). On the gateway backend the whole
+    /// action runs server-side (trusted loopback). On the direct backend the
+    /// turn itself must run in the caller's process — interactive approval
+    /// needs a human at the terminal — so the caller supplies `local_turn`,
+    /// which receives the already-open stores plus the session id and priming
+    /// input, and returns the reply. Eligibility, the priming digest, and the
+    /// at-most-once `recoverable` clear all stay in here.
+    pub async fn resume_run<F, Fut>(
+        &self,
+        id: Option<String>,
+        local_turn: F,
+    ) -> anyhow::Result<ResumeOutcome>
+    where
+        F: FnOnce(Arc<Db>, Arc<KanbanDb>, String, String) -> Fut,
+        Fut: Future<Output = anyhow::Result<String>>,
+    {
+        let target_id = match id {
+            Some(id) => id,
+            None => {
+                let OperatorQueryResult::Runs(runs) = self
+                    .query(OperatorQuery::Runs {
+                        limit: actions::RESUME_SCAN_LIMIT,
+                    })
+                    .await?
+                else {
+                    unreachable!("Runs query answers with Runs");
+                };
+                runs.into_iter()
+                    .find(|r| r.recoverable)
+                    .map(|r| r.id)
+                    .ok_or_else(|| anyhow::anyhow!(actions::NO_RECOVERABLE))?
+            }
+        };
+        match &self.backend {
+            OperatorBackend::Gateway(gw) => gw.client().resume(&target_id).await,
+            OperatorBackend::Direct(direct) => {
+                let db = direct.db().await?.clone();
+                match actions::resolve_resume(db.as_ref(), &target_id).await? {
+                    actions::ResumeTarget::Missing => {
+                        anyhow::bail!("no run with id `{target_id}`")
+                    }
+                    actions::ResumeTarget::NotRecoverable { status } => {
+                        anyhow::bail!(actions::not_recoverable_message(&target_id, &status))
+                    }
+                    actions::ResumeTarget::Ready { run, steps, input } => {
+                        let kanban = direct.kanban().await?.clone();
+                        let reply =
+                            local_turn(db.clone(), kanban, run.session_id.clone(), input).await?;
+                        // Clear the flag only after a turn was actually
+                        // dispatched; best-effort, like every ledger write.
+                        if let Err(error) =
+                            RunRepository::mark_resumed(db.as_ref(), &target_id).await
+                        {
+                            eprintln!("warning: failed to clear the recoverable flag: {error:#}");
+                        }
+                        Ok(ResumeOutcome {
+                            run_id: target_id,
+                            session_id: run.session_id,
+                            steps: steps.len(),
+                            reply,
+                        })
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Unix seconds — the operator surface's one clock read per request.
+pub(crate) fn now() -> i64 {
+    time::OffsetDateTime::now_utc().unix_timestamp()
+}
+
+#[cfg(test)]
+mod tests {
+    //! Contract tests over the direct backend. The gateway backend is a thin
+    //! mapping onto `GatewayClient` (its transport behaviors — stale
+    //! rendezvous fallback, 404 version skew — are tested there); business
+    //! results on both paths come from the same `actions` helpers, which these
+    //! tests exercise end-to-end through the `OperatorControl` interface.
+
+    use super::*;
+    use crate::domain::memory::{Memory, MemoryKind, MemoryRepository, MemoryStatus};
+    use crate::domain::run::Run;
+
+    fn temp_urls(tag: &str) -> StoreUrls {
+        let dir = std::env::temp_dir().join(format!("shion_opctl_{tag}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        StoreUrls {
+            db: format!("turso:{}", dir.join("shion.db").display()),
+            kanban: format!("turso:{}", dir.join("kanban.db").display()),
+            memory: format!("turso:{}", dir.join("memory.db").display()),
+        }
+    }
+
+    fn direct(urls: StoreUrls) -> OperatorControl {
+        OperatorControl {
+            backend: OperatorBackend::Direct(DirectOperatorAdapter::new(urls)),
+        }
+    }
+
+    #[tokio::test]
+    async fn queries_on_empty_stores_return_empty() {
+        let control = direct(temp_urls("empty"));
+        let OperatorQueryResult::Runs(runs) = control
+            .query(OperatorQuery::Runs { limit: 10 })
+            .await
+            .unwrap()
+        else {
+            panic!("Runs answers Runs");
+        };
+        assert!(runs.is_empty());
+        let OperatorQueryResult::Sessions(sessions) =
+            control.query(OperatorQuery::Sessions).await.unwrap()
+        else {
+            panic!("Sessions answers Sessions");
+        };
+        assert!(sessions.is_empty());
+        let OperatorQueryResult::DreamPreview(report) =
+            control.query(OperatorQuery::DreamPreview).await.unwrap()
+        else {
+            panic!("DreamPreview answers DreamPreview");
+        };
+        assert!(report.is_empty());
+    }
+
+    #[tokio::test]
+    async fn stores_open_lazily_per_request() {
+        let urls = temp_urls("lazy");
+        let memory_path = urls.memory.strip_prefix("turso:").unwrap().to_string();
+        let kanban_path = urls.kanban.strip_prefix("turso:").unwrap().to_string();
+        let control = direct(urls);
+        // A run-ledger read must not open the memory or kanban stores.
+        control
+            .query(OperatorQuery::Runs { limit: 5 })
+            .await
+            .unwrap();
+        assert!(
+            !std::path::Path::new(&memory_path).exists(),
+            "run list must not touch memory.db"
+        );
+        assert!(
+            !std::path::Path::new(&kanban_path).exists(),
+            "run list must not touch kanban.db"
+        );
+    }
+
+    #[tokio::test]
+    async fn memory_transition_promotes_and_batch_reuses_one_backend() {
+        let control = direct(temp_urls("memtrans"));
+        // Seed two candidates through the same lazily-opened store.
+        let OperatorQueryResult::Memories(initial) =
+            control.query(OperatorQuery::Memories).await.unwrap()
+        else {
+            panic!();
+        };
+        assert!(initial.is_empty());
+        let backend = match &control.backend {
+            OperatorBackend::Direct(d) => d,
+            _ => unreachable!(),
+        };
+        let store = backend.memory().await.unwrap().clone();
+        for content in ["likes tea", "works late"] {
+            let mut m = Memory::new(MemoryKind::Preference, content);
+            m.status = MemoryStatus::Candidate;
+            MemoryRepository::save(store.as_ref(), &m).await.unwrap();
+        }
+        let OperatorQueryResult::Memories(seeded) =
+            control.query(OperatorQuery::Memories).await.unwrap()
+        else {
+            panic!();
+        };
+        assert_eq!(seeded.len(), 2);
+        // Batch: two transitions on the one resolved backend.
+        for m in &seeded {
+            let result = control
+                .command(OperatorCommand::MemoryTransition {
+                    id: m.id.clone(),
+                    action: MemoryTransitionAction::Promote,
+                })
+                .await
+                .unwrap();
+            assert!(matches!(result, OperatorCommandResult::MemoryTransitioned));
+        }
+        let OperatorQueryResult::Memories(after) =
+            control.query(OperatorQuery::Memories).await.unwrap()
+        else {
+            panic!();
+        };
+        assert!(after.iter().all(|m| m.status == MemoryStatus::Active));
+
+        // An unknown id surfaces the same message the gateway path produces.
+        let err = control
+            .command(OperatorCommand::MemoryTransition {
+                id: "nope".into(),
+                action: MemoryTransitionAction::Reject,
+            })
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("no memory with id `nope`"));
+    }
+
+    #[tokio::test]
+    async fn pair_approve_unknown_code_is_not_found() {
+        let control = direct(temp_urls("pair"));
+        let OperatorCommandResult::PairApproved(outcome) = control
+            .command(OperatorCommand::PairApprove {
+                code: "ZZZZZZ".into(),
+            })
+            .await
+            .unwrap()
+        else {
+            panic!();
+        };
+        assert!(matches!(outcome, PairApproveOutcome::NotFound));
+    }
+
+    #[tokio::test]
+    async fn resume_reports_missing_and_not_recoverable() {
+        let control = direct(temp_urls("resume"));
+        // Nothing recoverable at all.
+        let err = control
+            .resume_run(None, |_, _, _, _| async { Ok(String::new()) })
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("no recoverable runs"));
+        // An explicit unknown id.
+        let err = control
+            .resume_run(Some("run-x".into()), |_, _, _, _| async {
+                Ok(String::new())
+            })
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("no run with id `run-x`"));
+        // A finished (non-recoverable) run.
+        let backend = match &control.backend {
+            OperatorBackend::Direct(d) => d,
+            _ => unreachable!(),
+        };
+        let db = backend.db().await.unwrap().clone();
+        let run = Run::start("cli:test", "hello");
+        let run_id = run.id.clone();
+        RunRepository::start(db.as_ref(), &run).await.unwrap();
+        let err = control
+            .resume_run(Some(run_id.clone()), |_, _, _, _| async {
+                Ok(String::new())
+            })
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("is not recoverable"));
+
+        // Interrupt-reconcile it, then resume dispatches the local turn and
+        // clears the flag (at-most-once).
+        RunRepository::reconcile_interrupted(db.as_ref(), now())
+            .await
+            .unwrap();
+        let outcome = control
+            .resume_run(Some(run_id.clone()), |_, _, session, input| async move {
+                assert_eq!(session, "cli:test");
+                assert!(input.contains("hello"), "priming digest carries the input");
+                Ok("done".to_string())
+            })
+            .await
+            .unwrap();
+        assert_eq!(outcome.run_id, run_id);
+        assert_eq!(outcome.reply, "done");
+        let again = control
+            .resume_run(Some(run_id), |_, _, _, _| async { Ok(String::new()) })
+            .await
+            .unwrap_err();
+        assert!(
+            again.to_string().contains("is not recoverable"),
+            "resume clears the recoverable flag"
+        );
+    }
+}

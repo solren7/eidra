@@ -7,8 +7,8 @@
 //! sender's next message — no restart.
 
 use crate::{
-    cli::gateway_client::{GatewayClient, PairApprove},
     domain::pairing::{ApproveOutcome, PairingRepository},
+    infra::gateway_client::{GatewayClient, PairApprove},
     infra::persistence::db::Db,
     services::operator_control::{PairingView, actions::pairing_views},
 };

@@ -4,13 +4,13 @@
 //! runtime. They are the operator's view into what the gateway will act on.
 
 use crate::{
-    cli::gateway_client::GatewayClient,
     domain::{
         reminder::ReminderRepository,
         repository::SessionRepository,
         run::RunRepository,
         task::{TaskRepository, TaskStatus},
     },
+    infra::gateway_client::GatewayClient,
     infra::persistence::{db::Db, kanban::KanbanDb},
     services::operator_control::{SessionSummary, actions::session_summaries},
 };

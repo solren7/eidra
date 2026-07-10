@@ -486,7 +486,7 @@ async fn run_prune(db: &str, before: Option<String>, keep: Option<usize>) -> any
     // Route through a running gateway (which holds the db lock) when one is up,
     // else open the db directly. The `--keep N` cutoff needs the run list, which
     // also comes from the gateway when routed.
-    let gw = crate::cli::gateway_client::GatewayClient::try_connect().await;
+    let gw = crate::infra::gateway_client::GatewayClient::try_connect().await;
     let cutoff = match (before, keep) {
         (Some(date), None) => parse_local_date(&date)?,
         (None, Some(keep)) => {
