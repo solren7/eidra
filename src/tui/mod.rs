@@ -16,6 +16,7 @@
 
 mod app;
 mod approver;
+mod markdown;
 mod ui;
 
 use std::sync::Arc;

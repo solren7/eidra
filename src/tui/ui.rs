@@ -13,6 +13,7 @@ use ratatui::{
 use unicode_width::UnicodeWidthChar;
 
 use super::app::{App, Role};
+use super::markdown::markdown_lines;
 
 const SPINNER: [&str; 4] = ["⠇", "⠋", "⠙", "⠸"];
 
@@ -36,8 +37,17 @@ fn render_transcript(frame: &mut Frame, app: &App, area: Rect) {
     let width = area.width.max(1) as usize;
     let mut lines: Vec<Line> = Vec::new();
     for entry in &app.entries {
+        // Agent replies render as markdown; everything else is plain text
+        // behind a colored role prefix.
+        if entry.role == Role::Agent {
+            for logical in markdown_lines(&entry.text) {
+                lines.extend(wrap_spans(logical.spans, width));
+            }
+            lines.push(Line::default());
+            continue;
+        }
         let (prefix, style) = match entry.role {
-            Role::You => ("you ❯ ", Style::new().fg(Color::Cyan)),
+            Role::You => ("❯ ", Style::new().fg(Color::Cyan)),
             Role::Agent => ("", Style::new()),
             Role::Info => ("· ", Style::new().fg(Color::DarkGray)),
             Role::Error => ("✗ ", Style::new().fg(Color::Red)),
@@ -211,6 +221,37 @@ pub(super) fn wrap_text(text: &str, width: usize) -> Vec<String> {
     out
 }
 
+/// Hard-wrap a logical line of styled spans to `width` display columns,
+/// splitting spans at char boundaries — the styled counterpart of
+/// [`wrap_text`], with the same CJK width rules. An empty input still yields
+/// one empty line so the entry occupies a row.
+fn wrap_spans(spans: Vec<Span<'static>>, width: usize) -> Vec<Line<'static>> {
+    let width = width.max(1);
+    let mut out = Vec::new();
+    let mut current: Vec<Span> = Vec::new();
+    let mut cols = 0usize;
+    for span in spans {
+        let mut buf = String::new();
+        for c in span.content.chars() {
+            let w = c.width().unwrap_or(0);
+            if cols + w > width && cols > 0 {
+                if !buf.is_empty() {
+                    current.push(Span::styled(std::mem::take(&mut buf), span.style));
+                }
+                out.push(Line::from(std::mem::take(&mut current)));
+                cols = 0;
+            }
+            buf.push(c);
+            cols += w;
+        }
+        if !buf.is_empty() {
+            current.push(Span::styled(buf, span.style));
+        }
+    }
+    out.push(Line::from(current));
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -232,6 +273,33 @@ mod tests {
         let text = "abcdefghij";
         let rejoined: String = wrap_text(text, 3).concat();
         assert_eq!(rejoined, text);
+    }
+
+    #[test]
+    fn wrap_spans_keeps_styles_across_the_break() {
+        let spans = vec![
+            Span::styled("你好", Style::new().fg(Color::Cyan)),
+            Span::styled("世界", Style::new().fg(Color::Red)),
+        ];
+        // 8 columns of CJK at width 4 = 2 chars per line, one span each.
+        let lines = wrap_spans(spans, 4);
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0].spans[0].content, "你好");
+        assert_eq!(lines[0].spans[0].style.fg, Some(Color::Cyan));
+        assert_eq!(lines[1].spans[0].content, "世界");
+        assert_eq!(lines[1].spans[0].style.fg, Some(Color::Red));
+    }
+
+    #[test]
+    fn wrap_spans_splits_one_span_without_losing_content() {
+        let lines = wrap_spans(vec![Span::raw("abcdefghij")], 3);
+        let rejoined: String = lines
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert_eq!(rejoined, "abcdefghij");
+        assert_eq!(lines.len(), 4);
     }
 
     #[test]
