@@ -41,7 +41,7 @@ cargo build --release
 ## Quick start
 
 ```bash
-komo init                       # scaffold ~/.komo/config.toml + .env (never overwrites)
+komo init                       # scaffold ~/.komo/config.toml + .env + SOUL.md (never overwrites)
 # then fill the DEEPSEEK_API_KEY= line in ~/.komo/.env
 
 komo chat                       # interactive chat (full-screen TUI; needs a terminal)
@@ -124,6 +124,7 @@ also unloads the former launchd job before installing `com.komo.gateway`.
 | `skills/` | durable governed skills (`SKILL.md` files; reviewer proposals in `skills/.candidates/`) |
 | `config.toml` | provider/model/channel behavior |
 | `.env` | API keys and channel credentials |
+| `SOUL.md` | agent persona (edit freely; picked up without a restart) |
 
 Delete `state.db` freely to reset development state. Do not delete `kanban.db`,
 `memory.db`, or `skills/` unless you intend to wipe durable personal data.

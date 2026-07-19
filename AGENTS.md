@@ -8,7 +8,7 @@ Guidance for coding agents (Claude Code and others) working in this repository.
 ```bash
 cargo check                        # fast compile check
 cargo build                        # build
-komo init                         # bootstrap ~/.komo: default config.toml + .env template (never overwrites)
+komo init                         # bootstrap ~/.komo: default config.toml + .env template + SOUL.md persona (never overwrites)
 cargo run -- chat                  # interactive chat: full-screen TUI (needs a terminal; scripts use the api channel) (db at ~/.komo/state.db)
 cargo run -- gateway               # always-on process: maintenance sweeps + ingress channels (feishu, telegram, wechat)
 cargo test                         # run all tests

@@ -1,10 +1,11 @@
 //! `komo init` — bootstrap the config home with commented templates.
 //!
-//! Writes a default `config.toml` and a `.env` credential template into
-//! `~/.komo/` (or `KOMO_HOME`). Existing files are never touched, so the
-//! command is safe to re-run and safe inside a running gateway (pure file
-//! ops, no db). Pairs with the degraded no-API-key startup: a fresh install
-//! boots, `komo init` scaffolds the files, the operator fills in a key.
+//! Writes a default `config.toml`, a `.env` credential template, and a
+//! default `SOUL.md` persona into `~/.komo/` (or `KOMO_HOME`). Existing files
+//! are never touched, so the command is safe to re-run and safe inside a
+//! running gateway (pure file ops, no db). Pairs with the degraded no-API-key
+//! startup: a fresh install boots, `komo init` scaffolds the files, the
+//! operator fills in a key.
 
 use std::path::Path;
 
@@ -83,11 +84,42 @@ DEEPSEEK_API_KEY=
 # API_SERVER_KEY=
 "#;
 
+/// The generated `~/.komo/SOUL.md` — the default persona, from the README's
+/// brand section (komorebi: sunlight through leaves). Replaces the built-in
+/// one-line identity in the system prompt; the operator edits it freely (the
+/// prompt builder re-reads it on mtime change, no restart needed).
+const SOUL_TEMPLATE: &str = "\
+你是 Komo，一位安静、可靠的个人助理。
+
+名字取自日语「木漏れ日」（komorebi）——阳光透过树叶洒落下来的样子。你的气质也如此：\
+温暖、清亮、不喧哗。像树荫下坐在身旁的老朋友：平时安静，开口时说到点子上，并且记得住\
+别人托付给你的每一件小事。
+
+你相信小事会积攒成光——一条提醒、一个待办、一段记忆，日积月累就是生活本身。\
+「陪你把日子攒成光」是你的座右铭（Light through your days）。
+
+行事风格：
+
+- **简洁**：先给结论和要做的事，少铺垫、不绕弯子。用用户的语言交流，中文时自然口语化，\
+不堆砌客套。
+- **踏实**：需要实时信息或要动手做事时，调用工具去查、去做，绝不凭空编造；查不到或\
+不确定，就直说不确定。
+- **记性好**：值得长期记住的事（偏好、约定、承诺、常用信息）主动记下来；聊到过去的事\
+先查记忆和会话历史，不靠猜。
+- **不吵闹**：主动消息（提醒、简报）只在真正有价值时才发；不追问无关紧要的细节，能\
+自己查到的不去烦用户。
+- **有分寸**：有副作用的操作走审批流程，拿不准的先问一句再动手；宁可慢半拍，不替用户\
+做重大决定。
+
+记住每一缕光。
+";
+
 pub fn run() -> anyhow::Result<()> {
     let home = crate::config::ensure_komo_home();
-    let (config_created, env_created) = init_at(&home)?;
+    let (config_created, env_created, soul_created) = init_at(&home)?;
     report("config.toml", &home, config_created);
     report(".env", &home, env_created);
+    report("SOUL.md", &home, soul_created);
     if config_created || env_created {
         println!(
             "\nNext: put your API key in {}/.env (DEEPSEEK_API_KEY=sk-...),\n\
@@ -107,10 +139,10 @@ fn report(name: &str, home: &Path, created: bool) {
     }
 }
 
-/// Write whichever of the two templates doesn't exist yet. Returns
-/// `(config_created, env_created)`. Never overwrites — an operator's edits
-/// outrank the template, always.
-fn init_at(home: &Path) -> anyhow::Result<(bool, bool)> {
+/// Write whichever of the three templates doesn't exist yet. Returns
+/// `(config_created, env_created, soul_created)`. Never overwrites — an
+/// operator's edits outrank the template, always.
+fn init_at(home: &Path) -> anyhow::Result<(bool, bool, bool)> {
     let config_created = write_if_absent(&home.join("config.toml"), CONFIG_TEMPLATE)?;
     let env_path = home.join(".env");
     let env_created = write_if_absent(&env_path, ENV_TEMPLATE)?;
@@ -120,7 +152,8 @@ fn init_at(home: &Path) -> anyhow::Result<(bool, bool)> {
         use std::os::unix::fs::PermissionsExt;
         let _ = std::fs::set_permissions(&env_path, std::fs::Permissions::from_mode(0o600));
     }
-    Ok((config_created, env_created))
+    let soul_created = write_if_absent(&home.join("SOUL.md"), SOUL_TEMPLATE)?;
+    Ok((config_created, env_created, soul_created))
 }
 
 fn write_if_absent(path: &Path, content: &str) -> anyhow::Result<bool> {
@@ -144,25 +177,34 @@ mod tests {
     }
 
     #[test]
-    fn init_creates_both_templates() {
+    fn init_creates_all_templates() {
         let home = tmp("creates");
-        let (config_created, env_created) = init_at(&home).unwrap();
-        assert!(config_created && env_created);
+        let (config_created, env_created, soul_created) = init_at(&home).unwrap();
+        assert!(config_created && env_created && soul_created);
         let config = std::fs::read_to_string(home.join("config.toml")).unwrap();
         assert!(config.contains("provider = \"deepseek\""));
         let env = std::fs::read_to_string(home.join(".env")).unwrap();
         assert!(env.contains("DEEPSEEK_API_KEY="));
+        let soul = std::fs::read_to_string(home.join("SOUL.md")).unwrap();
+        assert!(soul.contains("你是 Komo"));
     }
 
     #[test]
     fn init_never_overwrites_existing_files() {
         let home = tmp("preserves");
         std::fs::write(home.join("config.toml"), "provider = \"openai\"\n").unwrap();
-        let (config_created, env_created) = init_at(&home).unwrap();
+        std::fs::write(home.join("SOUL.md"), "You are Nyx.\n").unwrap();
+        let (config_created, env_created, soul_created) = init_at(&home).unwrap();
         assert!(!config_created, "existing config must be left alone");
         assert!(env_created, "missing .env is still scaffolded");
+        assert!(
+            !soul_created,
+            "an operator-edited persona must be left alone"
+        );
         let config = std::fs::read_to_string(home.join("config.toml")).unwrap();
         assert_eq!(config, "provider = \"openai\"\n");
+        let soul = std::fs::read_to_string(home.join("SOUL.md")).unwrap();
+        assert_eq!(soul, "You are Nyx.\n");
     }
 
     #[cfg(unix)]
