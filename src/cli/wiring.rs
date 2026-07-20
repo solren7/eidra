@@ -5,7 +5,7 @@
 //! that differs is the `Approver` — interactive at a TTY vs. auto-deny in the
 //! unattended gateway — so it is passed in.
 
-use std::{path::PathBuf, sync::Arc};
+use std::sync::Arc;
 
 use crate::{
     agent::{
@@ -165,17 +165,15 @@ pub async fn build(
 
     // Skills load from, in priority order (first to define a name wins):
     //   KOMO_SKILLS_PATH (colon-separated), <workspace>/skills,
-    //   <workspace>/.claude/skills, the governed ~/.komo/skills store, and the
-    //   user-global ~/.claude/skills shared by general agents (Claude Agent
-    //   Skills `SKILL.md` format).
+    //   <workspace>/.claude/skills, the governed ~/.komo/skills store, then the
+    //   user-global ~/.agents/skills and ~/.claude/skills shared by other agents.
     let root = workspace.roots().first().cloned().unwrap_or_default();
-    let mut skill_dirs: Vec<PathBuf> = config.runtime.skills_path.clone();
-    skill_dirs.push(root.join("skills"));
-    skill_dirs.push(root.join(".claude/skills"));
-    skill_dirs.push(skill_store.root().to_path_buf());
-    if let Some(home) = dirs::home_dir() {
-        skill_dirs.push(home.join(".claude/skills"));
-    }
+    let skill_dirs = crate::infra::skills::runtime_skill_dirs(
+        &config.runtime.skills_path,
+        &root,
+        skill_store.root(),
+        dirs::home_dir().as_deref(),
+    );
     let skills = Arc::new(SkillRegistry::load_from_dirs(&skill_dirs));
 
     // Keep the always-on preamble small: list a bounded catalog, the rest is

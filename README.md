@@ -63,8 +63,8 @@ komo task list                  # open durable tasks
 komo memory list                # memory candidates/active items
 komo run list                   # recent agent turns (⟲ marks interrupted, resumable ones)
 komo run resume                 # re-dispatch the last interrupted turn from the run ledger
-komo skill list                 # governed skills + reviewer candidates awaiting triage
-komo skill promote <name>       # accept a reviewer-proposed skill into the active store
+komo skills list                # managed + ~/.agents/skills + reviewer candidates
+komo skills promote <name>      # accept a reviewer-proposed skill into the active store
 ```
 
 ## Gateway (always-on background process)
@@ -105,7 +105,7 @@ The agent can call these during a chat turn:
 | `homeassistant` | Read and control Home Assistant entities when configured |
 | `session` | Look up past conversations |
 | `delegate` | Hand a sub-task to a cheaper auxiliary model |
-| `skill` | Load skills: workspace `skills/`·`.claude/skills/` dirs + the governed `~/.komo/skills` store |
+| `skill` | Load skills: workspace dirs + governed `~/.komo/skills` + shared `~/.agents/skills` |
 | `time` | Current time (RFC 3339 UTC) |
 
 ## Data Layout

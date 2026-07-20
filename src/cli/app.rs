@@ -66,10 +66,10 @@ enum Commands {
         #[arg(long)]
         apply: bool,
     },
-    /// Inspect registered skills
-    Skill {
+    /// Inspect and govern skills
+    Skills {
         #[command(subcommand)]
-        action: SkillAction,
+        action: SkillsAction,
     },
     /// Timeline of what komo has learned: memories (born/promoted/archived)
     /// and skills (proposed/activated), newest first
@@ -261,8 +261,8 @@ enum MemoryAction {
 }
 
 #[derive(Subcommand)]
-enum SkillAction {
-    /// List the governed skill store: active skills, then reviewer candidates
+enum SkillsAction {
+    /// List managed skills, shared ~/.agents/skills, and reviewer candidates
     List,
     /// Install a skill from a git repo or a raw SKILL.md URL into the active
     /// store (owner/repo, owner/repo/subpath, a GitHub URL, a *.git/git@ URL,
@@ -273,7 +273,7 @@ enum SkillAction {
     },
     /// Accept a reviewer candidate into the active store
     Promote {
-        /// Skill name (as shown under `candidates` in `skill list`)
+        /// Skill name (as shown under `candidates` in `skills list`)
         name: String,
     },
     /// Discard a reviewer candidate
@@ -428,17 +428,17 @@ pub async fn run() -> anyhow::Result<()> {
             }
         }
         Commands::Dream { apply } => dream::run(&operator(&config).await?, apply).await,
-        Commands::Skill { action } => match action {
-            SkillAction::List => inspect::skill_list(),
-            SkillAction::Install { source } => skill::install(&source).await,
-            SkillAction::Promote { name } => skill::promote(&name),
-            SkillAction::Reject { name } => skill::reject(&name),
-            SkillAction::Protect { name } => skill::protect(&name, true),
-            SkillAction::Unprotect { name } => skill::protect(&name, false),
-            SkillAction::Enable { name } => skill::set_enabled(&name, true),
-            SkillAction::Disable { name } => skill::set_enabled(&name, false),
-            SkillAction::Inspect { name } => skill::inspect(&name),
-            SkillAction::Audit { name } => skill::audit(&operator(&config).await?, &name).await,
+        Commands::Skills { action } => match action {
+            SkillsAction::List => skill::list(),
+            SkillsAction::Install { source } => skill::install(&source).await,
+            SkillsAction::Promote { name } => skill::promote(&name),
+            SkillsAction::Reject { name } => skill::reject(&name),
+            SkillsAction::Protect { name } => skill::protect(&name, true),
+            SkillsAction::Unprotect { name } => skill::protect(&name, false),
+            SkillsAction::Enable { name } => skill::set_enabled(&name, true),
+            SkillsAction::Disable { name } => skill::set_enabled(&name, false),
+            SkillsAction::Inspect { name } => skill::inspect(&name),
+            SkillsAction::Audit { name } => skill::audit(&operator(&config).await?, &name).await,
         },
         Commands::Journey { limit, since } => {
             journey::journey(&operator(&config).await?, limit, since).await
@@ -534,5 +534,16 @@ pub(crate) fn parse_local_date(s: &str) -> anyhow::Result<i64> {
     match chrono::Local.from_local_datetime(&midnight).single() {
         Some(dt) => Ok(dt.timestamp()),
         None => anyhow::bail!("ambiguous local time for `{s}`"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn skills_is_the_cli_command_name() {
+        assert!(Cli::try_parse_from(["komo", "skills", "list"]).is_ok());
+        assert!(Cli::try_parse_from(["komo", "skill", "list"]).is_err());
     }
 }

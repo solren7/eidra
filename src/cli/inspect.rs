@@ -214,38 +214,6 @@ pub async fn run_keep_cutoff(
     Ok(runs.get(keep).map(|r| r.started_at))
 }
 
-/// List the governed skill store (`~/.komo/skills`): active skills first,
-/// then reviewer candidates awaiting triage. Pure file reads — works whether
-/// or not the gateway is running (no db lock involved). Workspace-local skill
-/// dirs are per-repo and listed by the agent's own `skill` tool instead.
-pub fn skill_list() -> anyhow::Result<()> {
-    let store =
-        crate::infra::skills::FsSkillStore::new(crate::infra::skills::FsSkillStore::default_root());
-    let active = store.list_active();
-    let candidates = store.list_candidates();
-    if active.is_empty() && candidates.is_empty() {
-        println!("No skills in {}.", store.root().display());
-        return Ok(());
-    }
-    for s in &active {
-        let lock = if s.protected { " 🔒" } else { "" };
-        let off = if s.disabled { " [disabled]" } else { "" };
-        println!("{}{}{}  {}", s.name, lock, off, oneline(&s.description, 80));
-    }
-    if !candidates.is_empty() {
-        println!("\ncandidates (`komo skill promote|reject <name>`):");
-        for s in &candidates {
-            println!(
-                "  {}  [{}]  {}",
-                s.name,
-                s.source,
-                oneline(&s.description, 80)
-            );
-        }
-    }
-    Ok(())
-}
-
 /// List stored sessions with creation time and message counts.
 pub async fn session_list(control: &OperatorControl) -> anyhow::Result<()> {
     let OperatorQueryResult::Sessions(sessions) = control.query(OperatorQuery::Sessions).await?

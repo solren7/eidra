@@ -10,7 +10,7 @@
 //! - `<name>/SKILL.md` — an **active** skill, loaded into the runtime
 //!   `SkillRegistry` (the root is one of its scan directories).
 //! - `.candidates/<name>/SKILL.md` — a reviewer **proposal**, invisible to the
-//!   runtime until the operator promotes it (`komo skill promote`). The dot
+//!   runtime until the operator promotes it (`komo skills promote`). The dot
 //!   prefix keeps the registry's directory scan from ever loading it.
 //! - `.candidates/<name>/.history/<ts>.md` — prior candidate versions, rolled
 //!   on overwrite so a re-extraction never silently destroys the last proposal.
@@ -37,6 +37,27 @@ const CANDIDATES_DIR: &str = ".candidates";
 const HISTORY_DIR: &str = ".history";
 /// Marker file: the one-time import of legacy `komo.db` skills already ran.
 const DB_IMPORT_MARKER: &str = ".imported-from-db";
+
+/// Build the runtime's ordered skill search path. Earlier directories win when
+/// two skills share a name. `~/.agents/skills` is the shared, read-only skill
+/// collection used by Codex and other local agents; Komo discovers it without
+/// taking ownership of its files.
+pub fn runtime_skill_dirs(
+    configured: &[PathBuf],
+    workspace_root: &Path,
+    governed_root: &Path,
+    user_home: Option<&Path>,
+) -> Vec<PathBuf> {
+    let mut dirs = configured.to_vec();
+    dirs.push(workspace_root.join("skills"));
+    dirs.push(workspace_root.join(".claude/skills"));
+    dirs.push(governed_root.to_path_buf());
+    if let Some(home) = user_home {
+        dirs.push(home.join(".agents/skills"));
+        dirs.push(home.join(".claude/skills"));
+    }
+    dirs
+}
 
 pub struct FsSkillStore {
     root: PathBuf,
@@ -69,7 +90,7 @@ impl FsSkillStore {
     }
 
     /// Rolled prior versions of a candidate (file names, oldest first) — the
-    /// lightweight edit history `skill inspect` shows. Only the reviewer path
+    /// lightweight edit history `skills inspect` shows. Only the reviewer path
     /// rolls history; hand-edited active files are the user's own to version.
     pub fn candidate_history(&self, name: &str) -> Vec<String> {
         let dir = self.candidates_root().join(name).join(HISTORY_DIR);
@@ -185,7 +206,7 @@ impl FsSkillStore {
 
     /// Install a skill **directory** (its `SKILL.md` plus any supporting files —
     /// scripts, `references/`, etc.) as an **active** skill, copying the whole
-    /// tree. This is the install path (operator `komo skill install` + the
+    /// tree. This is the install path (operator `komo skills install` + the
     /// approved `skill` tool `install` action), distinct from `save`, which only
     /// renders a single-file candidate. Overwrites an existing active skill of
     /// the same name — unless it's protected, matching the `save` floor.
@@ -349,6 +370,29 @@ fn render(skill: &Skill) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn runtime_dirs_include_user_agents_skills() {
+        let configured = vec![PathBuf::from("/configured/skills")];
+        let dirs = runtime_skill_dirs(
+            &configured,
+            Path::new("/workspace"),
+            Path::new("/komo/skills"),
+            Some(Path::new("/user")),
+        );
+
+        assert_eq!(
+            dirs,
+            vec![
+                PathBuf::from("/configured/skills"),
+                PathBuf::from("/workspace/skills"),
+                PathBuf::from("/workspace/.claude/skills"),
+                PathBuf::from("/komo/skills"),
+                PathBuf::from("/user/.agents/skills"),
+                PathBuf::from("/user/.claude/skills"),
+            ]
+        );
+    }
 
     fn store(name: &str) -> FsSkillStore {
         let root = std::env::temp_dir().join(name);

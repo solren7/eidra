@@ -4,16 +4,142 @@
 //! whether or not the gateway is running (no db lock involved). The runtime
 //! `SkillRegistry` re-scans the skill dirs on every query, so changes that
 //! affect the agent's catalog (install / promote / enable / disable) take
-//! effect on its next `skill` list — no gateway restart.
+//! effect on its next agent `skill` tool list — no gateway restart.
 
 use crate::{
     cli::inspect::local_time,
     infra::skills::FsSkillStore,
     services::operator_control::{OperatorControl, OperatorQuery, OperatorQueryResult},
 };
+use std::{collections::HashSet, path::PathBuf};
 
 fn store() -> FsSkillStore {
     FsSkillStore::new(FsSkillStore::default_root())
+}
+
+fn shared_store() -> Option<FsSkillStore> {
+    dirs::home_dir().map(|home| FsSkillStore::new(home.join(".agents/skills")))
+}
+
+struct ReadableSkill {
+    skill: crate::domain::skill::Skill,
+    status: &'static str,
+    path: PathBuf,
+    history: Vec<String>,
+}
+
+fn find_readable_skill(
+    name: &str,
+    managed: &FsSkillStore,
+    shared: Option<&FsSkillStore>,
+) -> Option<ReadableSkill> {
+    if let Some(skill) = managed.find_active(name) {
+        return Some(ReadableSkill {
+            skill,
+            status: "active",
+            path: managed.active_path(name),
+            history: managed.candidate_history(name),
+        });
+    }
+    if let Some(skill) = managed.find_candidate(name) {
+        return Some(ReadableSkill {
+            skill,
+            status: "candidate",
+            path: managed.candidate_path(name),
+            history: managed.candidate_history(name),
+        });
+    }
+    shared.and_then(|shared| {
+        shared.find_active(name).map(|skill| ReadableSkill {
+            skill,
+            status: "shared (read-only)",
+            path: shared.active_path(name),
+            history: Vec::new(),
+        })
+    })
+}
+
+/// List Komo-managed skills plus the shared skills already installed for local
+/// agents under `~/.agents/skills`. Shared skills are discoverable and
+/// inspectable, but governance commands only mutate the managed store.
+pub fn list() -> anyhow::Result<()> {
+    let managed = store();
+    let shared = shared_store();
+    let active = managed.list_active();
+    let candidates = managed.list_candidates();
+    let managed_names = active
+        .iter()
+        .map(|skill| skill.name.as_str())
+        .collect::<HashSet<_>>();
+    let shared_skills = shared
+        .as_ref()
+        .map(FsSkillStore::list_active)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|skill| !managed_names.contains(skill.name.as_str()))
+        .collect::<Vec<_>>();
+
+    if active.is_empty() && candidates.is_empty() && shared_skills.is_empty() {
+        println!(
+            "No skills in {} or ~/.agents/skills.",
+            managed.root().display()
+        );
+        return Ok(());
+    }
+    if !active.is_empty() {
+        println!("managed ({}):", managed.root().display());
+        for skill in &active {
+            print_skill_line(skill, "  ");
+        }
+    }
+    if !shared_skills.is_empty() {
+        let root = shared
+            .as_ref()
+            .expect("shared skills came from this store")
+            .root();
+        println!("shared ({}; read-only):", root.display());
+        for skill in &shared_skills {
+            print_skill_line(skill, "  ");
+        }
+    }
+    if !candidates.is_empty() {
+        println!("candidates (`komo skills promote|reject <name>`):");
+        for skill in &candidates {
+            println!(
+                "  {}  [{}]  {}",
+                skill.name,
+                skill.source,
+                oneline(&skill.description, 80)
+            );
+        }
+    }
+    Ok(())
+}
+
+fn print_skill_line(skill: &crate::domain::skill::Skill, prefix: &str) {
+    let lock = if skill.protected { " 🔒" } else { "" };
+    let off = if skill.disabled { " [disabled]" } else { "" };
+    println!(
+        "{prefix}{}{}{}  {}",
+        skill.name,
+        lock,
+        off,
+        oneline(&skill.description, 80)
+    );
+}
+
+fn oneline(value: &str, max: usize) -> String {
+    let value = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    if value.chars().count() <= max {
+        return value;
+    }
+    format!(
+        "{}…",
+        value
+            .chars()
+            .take(max.saturating_sub(1))
+            .collect::<String>()
+    )
 }
 
 const RELOAD_HINT: &str = "Takes effect on the agent's next `skill` list (no restart needed).";
@@ -89,17 +215,18 @@ pub fn set_enabled(name: &str, enabled: bool) -> anyhow::Result<()> {
 /// One skill in full: status, provenance, file path, prior candidate versions,
 /// and the instruction body.
 pub fn inspect(name: &str) -> anyhow::Result<()> {
-    let store = store();
-    let (skill, status, path) = if let Some(s) = store.find_active(name) {
-        (s, "active", store.active_path(name))
-    } else if let Some(s) = store.find_candidate(name) {
-        (s, "candidate", store.candidate_path(name))
-    } else {
-        anyhow::bail!("no skill named `{name}` in {}", store.root().display());
-    };
+    let managed = store();
+    let shared = shared_store();
+    let found = find_readable_skill(name, &managed, shared.as_ref()).ok_or_else(|| {
+        anyhow::anyhow!(
+            "no skill named `{name}` in {} or ~/.agents/skills",
+            managed.root().display()
+        )
+    })?;
+    let skill = found.skill;
 
     println!("skill      {}", skill.name);
-    let mut state = status.to_string();
+    let mut state = found.status.to_string();
     if skill.protected {
         state.push_str(" 🔒 protected");
     }
@@ -108,19 +235,18 @@ pub fn inspect(name: &str) -> anyhow::Result<()> {
     }
     println!("status     {state}");
     println!("source     {}", skill.source);
-    println!("path       {}", path.display());
+    println!("path       {}", found.path.display());
     if !skill.description.is_empty() {
         println!("describes  {}", skill.description);
     }
-    let history = store.candidate_history(name);
-    if !history.is_empty() {
+    if !found.history.is_empty() {
         println!(
             "history    {} prior version(s): {}",
-            history.len(),
-            history.join(", ")
+            found.history.len(),
+            found.history.join(", ")
         );
     }
-    println!("audit      `komo skill audit {name}` shows which turns loaded it");
+    println!("audit      `komo skills audit {name}` shows which turns loaded it");
     println!("\n{}", skill.instructions);
     Ok(())
 }
@@ -152,4 +278,41 @@ pub async fn audit(control: &OperatorControl, name: &str) -> anyhow::Result<()> 
     }
     println!("\n(`komo run inspect <id>` shows the full turn.)");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    fn write_skill(root: &std::path::Path, name: &str, body: &str) {
+        let dir = root.join(name);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("SKILL.md"),
+            format!("---\nname: {name}\ndescription: test\n---\n{body}"),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn readable_skill_includes_shared_agents_store_with_managed_precedence() {
+        let base = std::env::temp_dir().join("komo_cli_shared_skills");
+        let _ = fs::remove_dir_all(&base);
+        let managed = FsSkillStore::new(base.join("managed"));
+        let shared = FsSkillStore::new(base.join("shared"));
+        write_skill(shared.root(), "only-shared", "shared body");
+        write_skill(shared.root(), "duplicate", "shared version");
+        write_skill(managed.root(), "duplicate", "managed version");
+
+        let found = find_readable_skill("only-shared", &managed, Some(&shared)).unwrap();
+        assert_eq!(found.status, "shared (read-only)");
+        assert!(found.skill.instructions.contains("shared body"));
+
+        let found = find_readable_skill("duplicate", &managed, Some(&shared)).unwrap();
+        assert_eq!(found.status, "active");
+        assert!(found.skill.instructions.contains("managed version"));
+
+        let _ = fs::remove_dir_all(&base);
+    }
 }

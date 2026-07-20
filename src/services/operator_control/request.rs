@@ -154,7 +154,7 @@ pub struct PairingView {
     pub created_at: i64,
 }
 
-/// One `skill view` step from the run ledger (backs `komo skill audit`).
+/// One `skill view` step from the run ledger (backs `komo skills audit`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SkillInvocation {
     pub run_id: String,

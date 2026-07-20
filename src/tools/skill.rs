@@ -166,7 +166,7 @@ impl Tool for SkillTool {
                 self.store.save(&skill).await?;
                 Ok(format!(
                     "Learned `{name}` as a candidate skill. Review it with \
-                     `komo skill inspect {name}`, then `komo skill promote {name}` \
+                     `komo skills inspect {name}`, then `komo skills promote {name}` \
                      to activate (usable on the agent's next `skill` list once promoted)."
                 ))
             }

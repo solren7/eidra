@@ -11,7 +11,7 @@ use crate::domain::skill::Skill;
 /// only the directory list and **re-scans on every query**, so a skill
 /// installed, promoted, enabled, or disabled on disk is reflected the next time
 /// the `skill` tool runs — no gateway restart needed (the filesystem is the
-/// source of truth, matching `FsSkillStore` and the `komo skill` CLI). Reads
+/// source of truth, matching `FsSkillStore` and the `komo skills` CLI). Reads
 /// touch only a handful of small files, so live scanning is cheap. A registry
 /// built via [`new`](Self::new) instead holds a fixed list and never re-scans
 /// (used by tests).
@@ -36,7 +36,7 @@ impl SkillRegistry {
     }
 
     /// A live registry over multiple directories (e.g. komo's own `skills/`,
-    /// the project's `.claude/skills/`, and the user's `~/.claude/skills/`).
+    /// the project's `.claude/skills/`, and the user's `~/.agents/skills/`).
     /// Each query re-scans these, so on-disk changes appear without a restart.
     /// The first directory to define a given skill name wins, so workspace-local
     /// skills override globally-shared ones.
@@ -159,7 +159,7 @@ mod tests {
     /// A skill written to disk *after* the registry is built must appear on the
     /// next query without reconstructing the registry — this is the no-restart
     /// hot-reload behavior (the bug that made `skill list` miss a freshly
-    /// installed skill while `komo skill list` saw it).
+    /// installed skill while `komo skills list` saw it).
     #[test]
     fn rescans_disk_so_new_skills_appear_without_restart() {
         let dir = std::env::temp_dir().join("komo_skill_hot_reload_test");

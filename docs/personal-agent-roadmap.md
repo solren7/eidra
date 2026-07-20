@@ -183,10 +183,10 @@ api channel 的 loopback HTTP 已经覆盖这个需求的大半：脚本、Rayca
 
 **skill governance 已落地**（`.scratch/skill-governance/PRD.md`）。前提是先收敛了存储：过去 reviewer 写 komo.db、运行时读文件目录，两套互不可见；现在**文件系统是唯一事实源**——`~/.komo/skills/` 是 komo 自有的 durable skill 主目录（与 memory.db/kanban.db 同级），db 存量一次性导出为 candidate 后 `SkillRecord` 退役。治理四件套：
 
-- triage：reviewer 提取只落 `.candidates/`（覆盖前滚 `.history/`），`komo skill promote|reject` 由 operator 决定，从不直接生效——与 memory candidate 同一梯子。
+- triage：reviewer 提取只落 `.candidates/`（覆盖前滚 `.history/`），`komo skills promote|reject` 由 operator 决定，从不直接生效——与 memory candidate 同一梯子。
 - 保护：`protected` = 只有 operator 能改；reviewer 连 candidate 提案都不生成（保护挡在提案生成处，防"一键 promote 覆盖"）；agent 无 skill 写路径。
 - 启停：`disabled` 的 skill 留在盘上可 inspect，但不进模型 catalog，`skill view` 返回明确的"已停用"。
-- inspect 与审计：`komo skill inspect` 显示全文/来源/路径/历史；`komo skill audit` 从 run ledger 的 `skill view` steps **派生**调用记录（不存任何 usage 计数字段）。
+- inspect 与审计：`komo skills inspect` 显示全文/来源/路径/历史；`komo skills audit` 从 run ledger 的 `skill view` steps **派生**调用记录（不存任何 usage 计数字段）。
 
 所有治理命令都是纯文件操作，gateway 持锁时照常可用。**live registry 热加载已落地**：`SkillRegistry` 每次查询都重扫 skill 目录，install/promote/enable/disable 在 `skill` 工具的下一次 `list`/`view` 就可见，无需重启 gateway。仍冻结在启动快照的只有系统提示里那份 capped skills catalog teaser（活在 cache-stable 提示层，为保 prompt 缓存刻意不热加载；它只是个有界提示，指引模型调 `skill` list 拿完整实时集）。
 

@@ -1,6 +1,6 @@
 //! Install a skill from a remote source into the active skill store.
 //!
-//! Shared by the operator CLI (`komo skill install`) and the approved `skill`
+//! Shared by the operator CLI (`komo skills install`) and the approved `skill`
 //! tool `install` action. Two source shapes are supported:
 //!
 //! - a **git repository** (`owner/repo`, `owner/repo/subpath`, a GitHub

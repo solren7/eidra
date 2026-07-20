@@ -698,13 +698,13 @@ async fn list_reminders(State(state): State<AppState>) -> Result<Json<Value>, Ap
     Ok(Json(json!({ "reminders": pending })))
 }
 
-/// Registered skills (backs `komo skill list`), by name.
+/// Registered skills (backs `komo skills list`), by name.
 async fn list_skills(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
     let skills = state.actions.list_skills().await?;
     Ok(Json(json!({ "skills": skills })))
 }
 
-/// Which turns loaded a skill (backs `komo skill audit` while the gateway
+/// Which turns loaded a skill (backs `komo skills audit` while the gateway
 /// holds the db lock). Derived from the run ledger via the shared operator
 /// projection.
 async fn skill_audit(

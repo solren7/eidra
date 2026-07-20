@@ -78,7 +78,7 @@ pub async fn journey(
     }
     println!(
         "\n({} event(s); timings inferred from created/updated + file mtimes. \
-         `komo memory list` / `komo skill list` show current state.)",
+         `komo memory list` / `komo skills list` show current state.)",
         shown.len()
     );
     Ok(())
@@ -137,7 +137,7 @@ pub(crate) fn memory_events(memories: &[Memory]) -> Vec<Event> {
 
 /// Flatten the skill store into candidate / active events, timed by the
 /// `SKILL.md` file mtime. Reads files only — no db lock, so it works while the
-/// gateway runs (same as `komo skill`).
+/// gateway runs (same as `komo skills`).
 fn skill_events(store: &FsSkillStore) -> Vec<Event> {
     let mut events = Vec::new();
     for s in store.list_candidates() {
