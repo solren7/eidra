@@ -4,9 +4,10 @@
 //! The prompt is built in three cache-ordered tiers and joined into one
 //! string (stable → context → volatile):
 //!
-//!   * **stable**   — identity/persona, tool-aware behavioral guidance (only
-//!     for tools that are actually loaded), and the skills catalog. Never
-//!     changes for the life of the process.
+//!   * **stable**   — identity/persona, the operator-authored user profile
+//!     (`~/.komo/USER.md`, main agent only), tool-aware behavioral guidance
+//!     (only for tools that are actually loaded), and the skills catalog.
+//!     Re-read only when a source file's mtime moves.
 //!   * **context**  — project instruction files (`AGENTS.md` / `CLAUDE.md` /
 //!     `.cursorrules`) found in the working directory. Stable within a session.
 //!   * **volatile** — day-precision date, model, provider. The only part that
@@ -97,6 +98,14 @@ const CONTEXT_FILES: [&str; 3] = ["AGENTS.md", "CLAUDE.md", ".cursorrules"];
 /// Cap on an included context file, mirroring hermes' 20k-char head truncation.
 const CONTEXT_FILE_CAP: usize = 20_000;
 
+/// Header for the operator-authored user profile block (`~/.komo/USER.md`), the
+/// analog of hermes' USER.md. Trusted (operator-authored, like `SOUL.md`) —
+/// unlike the memory-derived pinned/recall blocks, which are flagged as
+/// untrusted data. Kept in the stable tier and distinct from those blocks: this
+/// is the hand-written profile, they are what was pinned/recalled during use.
+const USER_PROFILE_HEADER: &str =
+    "The following is what you know about the user, from their profile in ~/.komo/USER.md:";
+
 /// Assembles komo's system prompt from cache-ordered tiers.
 ///
 /// Built via chained setters, then `build()`:
@@ -115,6 +124,10 @@ pub struct SystemPromptBuilder {
     /// Include the Komo self-configuration manual (main agent only — aux
     /// sub-agents and sweeps never field "how do I configure Komo" questions).
     operations_manual: bool,
+    /// Inject the operator-authored `~/.komo/USER.md` profile (main agent only —
+    /// aux/reviewer/briefing stay lean, and the reviewer must not have the
+    /// profile bias its extraction).
+    include_user_profile: bool,
     model: String,
     provider: &'static str,
     home: PathBuf,
@@ -140,6 +153,7 @@ impl SystemPromptBuilder {
             skills_note: None,
             workspace_root: None,
             operations_manual: false,
+            include_user_profile: false,
             model: config.model.clone(),
             provider: config.provider.name(),
             home: komo_home(),
@@ -172,6 +186,14 @@ impl SystemPromptBuilder {
         self
     }
 
+    /// Inject the operator-authored `~/.komo/USER.md` profile into the stable
+    /// tier (main agent only). Read on mtime change like `SOUL.md`, so editing
+    /// the profile takes effect next turn with no restart.
+    pub fn user_profile(mut self) -> Self {
+        self.include_user_profile = true;
+        self
+    }
+
     /// Override the home directory used to look up `SOUL.md` (tests).
     #[cfg(test)]
     fn home(mut self, home: PathBuf) -> Self {
@@ -195,6 +217,20 @@ impl SystemPromptBuilder {
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| IDENTITY.to_string());
         parts.push(persona);
+
+        // Operator-authored user profile (hermes' USER.md analog), main agent
+        // only. Right after the persona so all the "who am I / who is this for"
+        // context sits together, and before the pinned/recall memory blocks the
+        // enricher appends later (distinct source, distinct trust).
+        if self.include_user_profile {
+            if let Some(profile) = std::fs::read_to_string(self.home.join("USER.md"))
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+            {
+                parts.push(format!("{USER_PROFILE_HEADER}\n\n{profile}"));
+            }
+        }
 
         // Tool-aware guidance: only inject when the tool is loaded.
         if self.has("time") {
@@ -265,6 +301,11 @@ impl SystemPromptBuilder {
             std::fs::metadata(path).and_then(|m| m.modified()).ok()
         }
         let mut fp = vec![mtime(&self.home.join("SOUL.md"))];
+        // Only when the profile is actually read, so aux builders (which never
+        // inject it) keep a cache that a USER.md edit doesn't needlessly bust.
+        if self.include_user_profile {
+            fp.push(mtime(&self.home.join("USER.md")));
+        }
         if let Some(root) = &self.workspace_root {
             for name in CONTEXT_FILES {
                 fp.push(mtime(&root.join(name)));
@@ -380,6 +421,50 @@ mod tests {
         let date_at = p.find("Today's date is").unwrap();
         assert!(manual_at < date_at, "manual belongs to the stable prefix");
         assert!(p.contains("komo pair approve"));
+    }
+
+    #[test]
+    fn user_profile_is_opt_in_main_agent_only_and_stable_tier() {
+        let home = tmp("user_profile");
+        std::fs::write(home.join("USER.md"), "Name: Ada. Prefers terse replies.").unwrap();
+
+        // Off by default (aux/reviewer/briefing builders) — profile stays out.
+        let off = SystemPromptBuilder::new(&config())
+            .home(home.clone())
+            .build();
+        assert!(!off.contains("Ada"), "profile must be gated off by default");
+
+        // On for the main agent: injected, labeled, and in the stable prefix.
+        let on = SystemPromptBuilder::new(&config())
+            .home(home)
+            .user_profile()
+            .build();
+        assert!(on.contains("Name: Ada. Prefers terse replies."));
+        let profile_at = on.find("Ada").unwrap();
+        let date_at = on.find("Today's date is").unwrap();
+        assert!(profile_at < date_at, "profile belongs to the stable prefix");
+        assert!(on.contains("~/.komo/USER.md"), "profile block is labeled");
+    }
+
+    #[test]
+    fn user_profile_absent_when_file_missing_or_empty() {
+        let home = tmp("user_profile_empty");
+        // No file at all.
+        let p = SystemPromptBuilder::new(&config())
+            .home(home.clone())
+            .user_profile()
+            .build();
+        assert!(!p.contains("~/.komo/USER.md"), "no header when file absent");
+        // Present but blank → still nothing injected (filtered on trim).
+        std::fs::write(home.join("USER.md"), "\n  \n").unwrap();
+        let p = SystemPromptBuilder::new(&config())
+            .home(home)
+            .user_profile()
+            .build();
+        assert!(
+            !p.contains("~/.komo/USER.md"),
+            "no header for a blank profile"
+        );
     }
 
     #[test]

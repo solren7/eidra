@@ -115,13 +115,41 @@ const SOUL_TEMPLATE: &str = "\
 记住每一缕光。
 ";
 
+/// The generated `~/.komo/USER.md` — the operator-authored user profile
+/// (hermes' USER.md analog). Injected into the **main agent's** stable system
+/// prompt each turn, re-read on mtime change (no restart). A fill-in skeleton:
+/// only long-term stable facts belong here — churny facts/projects/lessons go
+/// to the memory store and AGENTS.md instead.
+const USER_TEMPLATE: &str = r#"# USER.md — 用户画像（komo 每轮读入主 agent 的稳定信息）
+
+<!--
+对标 hermes 的 USER.md：只记**长期稳定**的东西——身份、偏好、习惯、雷区。
+会变的事实 / 项目 / 经验交给记忆库（memory）和 AGENTS.md，别写这里。
+保持精炼，它每轮都占 token。改完下一轮生效，无需重启（按 mtime 重读，和 SOUL.md 一样）。
+删掉这些注释、填上真实内容即可。
+-->
+
+## 身份
+<!-- 姓名 / 称呼、角色、公司或团队、时区、常用语言 -->
+
+## 沟通偏好
+<!-- 简洁 vs 详细、要不要先给结论、格式偏好（表格 / 分点）、用什么语言回你 -->
+
+## 工作习惯
+<!-- 常用技术栈与熟练度、编辑器 / 工具、工作流 -->
+
+## 雷区 / 避免
+<!-- 明确不喜欢的做法、忌讳、绝对不要做的事 -->
+"#;
+
 pub fn run() -> anyhow::Result<()> {
     let home = crate::config::ensure_komo_home();
-    let (config_created, env_created, soul_created) = init_at(&home)?;
-    report("config.toml", &home, config_created);
-    report(".env", &home, env_created);
-    report("SOUL.md", &home, soul_created);
-    if config_created || env_created {
+    let created = init_at(&home)?;
+    report("config.toml", &home, created.config);
+    report(".env", &home, created.env);
+    report("SOUL.md", &home, created.soul);
+    report("USER.md", &home, created.user);
+    if created.config || created.env {
         println!(
             "\nNext: put your API key in {}/.env (DEEPSEEK_API_KEY=sk-...),\n\
              then restart the gateway. `komo doctor` verifies the result.",
@@ -140,21 +168,35 @@ fn report(name: &str, home: &Path, created: bool) {
     }
 }
 
-/// Write whichever of the three templates doesn't exist yet. Returns
-/// `(config_created, env_created, soul_created)`. Never overwrites — an
-/// operator's edits outrank the template, always.
-fn init_at(home: &Path) -> anyhow::Result<(bool, bool, bool)> {
-    let config_created = write_if_absent(&home.join("config.toml"), CONFIG_TEMPLATE)?;
+/// Which scaffolds this `init` actually created (vs left untouched).
+#[derive(Debug, Clone, Copy)]
+struct Created {
+    config: bool,
+    env: bool,
+    soul: bool,
+    user: bool,
+}
+
+/// Write whichever template doesn't exist yet. Never overwrites — an operator's
+/// edits outrank the template, always.
+fn init_at(home: &Path) -> anyhow::Result<Created> {
+    let config = write_if_absent(&home.join("config.toml"), CONFIG_TEMPLATE)?;
     let env_path = home.join(".env");
-    let env_created = write_if_absent(&env_path, ENV_TEMPLATE)?;
+    let env = write_if_absent(&env_path, ENV_TEMPLATE)?;
     // Credentials file: owner-only, same floor `ensure_komo_home` maintains.
     #[cfg(unix)]
-    if env_created {
+    if env {
         use std::os::unix::fs::PermissionsExt;
         let _ = std::fs::set_permissions(&env_path, std::fs::Permissions::from_mode(0o600));
     }
-    let soul_created = write_if_absent(&home.join("SOUL.md"), SOUL_TEMPLATE)?;
-    Ok((config_created, env_created, soul_created))
+    let soul = write_if_absent(&home.join("SOUL.md"), SOUL_TEMPLATE)?;
+    let user = write_if_absent(&home.join("USER.md"), USER_TEMPLATE)?;
+    Ok(Created {
+        config,
+        env,
+        soul,
+        user,
+    })
 }
 
 fn write_if_absent(path: &Path, content: &str) -> anyhow::Result<bool> {
@@ -180,14 +222,16 @@ mod tests {
     #[test]
     fn init_creates_all_templates() {
         let home = tmp("creates");
-        let (config_created, env_created, soul_created) = init_at(&home).unwrap();
-        assert!(config_created && env_created && soul_created);
+        let created = init_at(&home).unwrap();
+        assert!(created.config && created.env && created.soul && created.user);
         let config = std::fs::read_to_string(home.join("config.toml")).unwrap();
         assert!(config.contains("provider = \"deepseek\""));
         let env = std::fs::read_to_string(home.join(".env")).unwrap();
         assert!(env.contains("DEEPSEEK_API_KEY="));
         let soul = std::fs::read_to_string(home.join("SOUL.md")).unwrap();
         assert!(soul.contains("你是 Komo"));
+        let user = std::fs::read_to_string(home.join("USER.md")).unwrap();
+        assert!(user.contains("USER.md") && user.contains("## 身份"));
     }
 
     #[test]
@@ -195,17 +239,24 @@ mod tests {
         let home = tmp("preserves");
         std::fs::write(home.join("config.toml"), "provider = \"openai\"\n").unwrap();
         std::fs::write(home.join("SOUL.md"), "You are Nyx.\n").unwrap();
-        let (config_created, env_created, soul_created) = init_at(&home).unwrap();
-        assert!(!config_created, "existing config must be left alone");
-        assert!(env_created, "missing .env is still scaffolded");
+        std::fs::write(home.join("USER.md"), "name: Ada\n").unwrap();
+        let created = init_at(&home).unwrap();
+        assert!(!created.config, "existing config must be left alone");
+        assert!(created.env, "missing .env is still scaffolded");
         assert!(
-            !soul_created,
+            !created.soul,
             "an operator-edited persona must be left alone"
+        );
+        assert!(
+            !created.user,
+            "an operator-edited profile must be left alone"
         );
         let config = std::fs::read_to_string(home.join("config.toml")).unwrap();
         assert_eq!(config, "provider = \"openai\"\n");
         let soul = std::fs::read_to_string(home.join("SOUL.md")).unwrap();
         assert_eq!(soul, "You are Nyx.\n");
+        let user = std::fs::read_to_string(home.join("USER.md")).unwrap();
+        assert_eq!(user, "name: Ada\n");
     }
 
     #[cfg(unix)]

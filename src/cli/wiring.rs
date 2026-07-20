@@ -211,7 +211,10 @@ pub async fn build(
             // The main agent fields "how do I configure Komo" questions, so it
             // gets the built-in platform manual (wechat login, pairing, …).
             // Aux/delegate/briefing builders deliberately don't.
-            .operations_manual(),
+            .operations_manual()
+            // …and the operator-authored user profile (~/.komo/USER.md), for the
+            // same reason the aux/reviewer/briefing builders don't get it.
+            .user_profile(),
     );
     let preamble: PreambleFn = Arc::new(move || prompt_builder.build());
 
