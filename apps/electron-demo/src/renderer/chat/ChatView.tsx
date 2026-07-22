@@ -24,8 +24,11 @@ function MarkdownText() {
 
 function UserMessage() {
   return (
-    <MessagePrimitive.Root className="msg user">
-      <div className="bubble user">
+    <MessagePrimitive.Root className="flex justify-end">
+      <div
+        className="max-w-[80%] px-3.5 py-2 rounded-2xl rounded-br-md leading-relaxed whitespace-pre-wrap break-words text-white shadow-(--mc-shadow-card)"
+        style={{ background: "var(--mc-accent-grad)" }}
+      >
         <MessagePrimitive.Parts />
       </div>
     </MessagePrimitive.Root>
@@ -34,8 +37,8 @@ function UserMessage() {
 
 function AssistantMessage() {
   return (
-    <MessagePrimitive.Root className="msg assistant">
-      <div className="bubble assistant">
+    <MessagePrimitive.Root className="flex justify-start">
+      <div className="max-w-[80%] px-3.5 py-2 rounded-2xl rounded-bl-md leading-relaxed break-words bg-(--mc-surface-strong) border border-(--mc-border) text-(--mc-fg)">
         <MessagePrimitive.Parts components={{ Text: MarkdownText }} />
       </div>
     </MessagePrimitive.Root>
@@ -51,19 +54,29 @@ function ApprovalModal({
 }) {
   const dangerous = req.risk === "dangerous";
   return (
-    <div className="modal-backdrop">
-      <div className={dangerous ? "modal danger" : "modal"}>
-        <div className="modal-title">{dangerous ? "🛑 需要审批（危险操作）" : "⚠️ 需要审批"}</div>
-        <div className="modal-summary">{req.summary}</div>
-        {req.detail && <div className="modal-detail">{req.detail}</div>}
-        <div className="modal-actions">
-          <button className="btn ok" onClick={() => onDecide("once")}>
+    <div className="fixed inset-0 z-[100] flex items-center justify-center bg-black/45 backdrop-blur-sm">
+      <div
+        className={`w-[min(480px,90vw)] p-5 rounded-2xl bg-(--mc-bg-elev) shadow-(--mc-shadow-card) border ${
+          dangerous ? "border-(--mc-danger)" : "border-(--mc-border-strong)"
+        }`}
+      >
+        <div className="font-bold mb-2.5 text-(--mc-fg)">
+          {dangerous ? "🛑 需要审批（危险操作）" : "⚠️ 需要审批"}
+        </div>
+        <div className="mb-2 break-words text-(--mc-fg)">{req.summary}</div>
+        {req.detail && (
+          <div className="text-[13px] text-(--mc-fg-muted) whitespace-pre-wrap mb-2">
+            {req.detail}
+          </div>
+        )}
+        <div className="flex gap-2 justify-end mt-3.5">
+          <button className={btn("accent")} onClick={() => onDecide("once")}>
             批准本次
           </button>
-          <button className="btn" onClick={() => onDecide("session")}>
+          <button className={btn()} onClick={() => onDecide("session")}>
             批准本会话
           </button>
-          <button className="btn deny" onClick={() => onDecide("deny")}>
+          <button className={btn("danger")} onClick={() => onDecide("deny")}>
             拒绝
           </button>
         </div>
@@ -79,11 +92,11 @@ function ClarifyBar({ question, onAnswer }: { question: string; onAnswer: (text:
     if (t) onAnswer(t);
   };
   return (
-    <div className="clarify">
-      <div className="clarify-q">❓ {question}</div>
-      <div className="clarify-row">
+    <div className="mx-4 mb-2 px-3.5 py-2.5 rounded-[12px] border border-(--mc-accent-ring) bg-(--mc-accent-soft)">
+      <div className="font-semibold mb-1.5 text-(--mc-fg)">❓ {question}</div>
+      <div className="flex gap-2">
         <input
-          className="clarify-input"
+          className="flex-1 px-2.5 py-1.5 rounded-[10px] border border-(--mc-border) bg-(--mc-bg) text-(--mc-fg) outline-none focus:border-(--mc-accent)"
           value={text}
           placeholder="输入你的回答…"
           onChange={(e) => setText(e.target.value)}
@@ -91,12 +104,22 @@ function ClarifyBar({ question, onAnswer }: { question: string; onAnswer: (text:
             if (e.key === "Enter") submit();
           }}
         />
-        <button className="btn ok" onClick={submit}>
+        <button className={btn("accent")} onClick={submit}>
           回答
         </button>
       </div>
     </div>
   );
+}
+
+/** Shared button styles (accent / danger / neutral). */
+function btn(kind?: "accent" | "danger"): string {
+  const base = "px-3.5 py-1.5 rounded-[10px] text-[13px] cursor-pointer border transition-colors";
+  if (kind === "accent")
+    return `${base} border-transparent text-white hover:opacity-90 [background:var(--mc-accent-grad)]`;
+  if (kind === "danger")
+    return `${base} border-(--mc-border) bg-(--mc-surface-2) text-(--mc-danger) hover:border-(--mc-danger)`;
+  return `${base} border-(--mc-border) bg-(--mc-surface-2) text-(--mc-fg) hover:border-(--mc-accent)`;
 }
 
 export function ChatView() {
@@ -107,9 +130,7 @@ export function ChatView() {
   // One turn = one chat request. While it's in flight, poll the interactions
   // endpoint so an approval raises the modal and a clarify raises the answer
   // bar; both resolve out-of-band and the same request eventually returns the
-  // final reply. `mode` is read live via a ref-free closure over state is fine
-  // here because the adapter is recreated when `session` changes (the view is
-  // keyed by session in App) — but capture mode through a getter to stay live.
+  // final reply. Capture `mode` through a getter so it stays live.
   const modeGetter = useMemo(() => ({ current: mode }), [mode]);
 
   const adapter = useMemo<ChatModelAdapter>(
@@ -176,25 +197,30 @@ export function ChatView() {
 
   return (
     <AssistantRuntimeProvider runtime={runtime}>
-      <div className="chat">
-        <ThreadPrimitive.Root className="thread">
-          <ThreadPrimitive.Viewport className="messages">
+      <div className="flex-1 flex flex-col min-h-0">
+        <ThreadPrimitive.Root className="flex-1 flex flex-col min-h-0">
+          <ThreadPrimitive.Viewport className="flex-1 overflow-y-auto min-h-0 px-4 py-5 flex flex-col gap-3">
             <ThreadPrimitive.Empty>
-              <div className="empty">开始和 komo 对话…</div>
+              <div className="flex-1 flex items-center justify-center text-(--mc-fg-faint) py-10">
+                开始和 komo 对话…
+              </div>
             </ThreadPrimitive.Empty>
-            <ThreadPrimitive.Messages
-              components={{ UserMessage, AssistantMessage }}
-            />
+            <ThreadPrimitive.Messages components={{ UserMessage, AssistantMessage }} />
             <ThreadPrimitive.If running>
-              <div className="typing">komo 正在思考…</div>
+              <div className="text-[13px] italic text-(--mc-fg-faint) px-1">komo 正在思考…</div>
             </ThreadPrimitive.If>
           </ThreadPrimitive.Viewport>
 
           {question && <ClarifyBar question={question} onAnswer={answer} />}
 
-          <ComposerPrimitive.Root className="composer">
-            <ComposerPrimitive.Input className="composer-input" placeholder="给 komo 发消息…" />
-            <ComposerPrimitive.Send className="send">发送</ComposerPrimitive.Send>
+          <ComposerPrimitive.Root className="flex gap-2 items-end px-4 py-3 border-t border-(--mc-border)">
+            <ComposerPrimitive.Input
+              className="flex-1 resize-none min-h-[44px] max-h-[160px] px-3.5 py-3 rounded-[14px] border border-(--mc-border) bg-(--mc-surface-strong) text-(--mc-fg) outline-none focus:border-(--mc-accent) focus:shadow-(--mc-shadow-glow) transition-shadow font-[inherit]"
+              placeholder="给 komo 发消息…"
+            />
+            <ComposerPrimitive.Send className="shrink-0 h-11 px-5 rounded-[14px] cursor-pointer text-white font-medium hover:opacity-90 transition-opacity [background:var(--mc-accent-grad)]">
+              发送
+            </ComposerPrimitive.Send>
           </ComposerPrimitive.Root>
         </ThreadPrimitive.Root>
 

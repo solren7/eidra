@@ -7,10 +7,11 @@
 // the "REST-over-IPC" pattern hermes-agent's desktop uses, minus the WebSocket
 // gateway (komo has no token streaming yet, so chat is one request/response).
 
-const { app, BrowserWindow, ipcMain, shell } = require("electron");
-const fs = require("node:fs");
-const os = require("node:os");
-const path = require("node:path");
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+
+import { app, BrowserWindow, ipcMain, shell } from "electron";
 
 const PROBE_TIMEOUT_MS = 2000;
 // Longer than a plain HTTP request: an interactive turn can block server-side on
@@ -18,8 +19,23 @@ const PROBE_TIMEOUT_MS = 2000;
 // the model has already done work.
 const REQUEST_TIMEOUT_MS = 600_000;
 
+interface Gateway {
+  base: string;
+  key: string;
+}
+interface ApiRequest {
+  path: string;
+  method?: string;
+  body?: unknown;
+}
+interface ChatRequest {
+  header: string;
+  message: string;
+  mode?: "interactive" | "trusted";
+}
+
 /** Resolve ~/.komo, honoring KOMO_HOME / SHION_HOME and the .shion legacy dir. */
-function komoHome() {
+function komoHome(): string {
   const env = process.env.KOMO_HOME || process.env.SHION_HOME;
   if (env && env.length > 0) return env;
   const home = os.homedir();
@@ -30,7 +46,7 @@ function komoHome() {
 }
 
 /** Read the gateway rendezvous file, or null if absent/unparseable. */
-function readGateway() {
+function readGateway(): Gateway | null {
   try {
     const raw = fs.readFileSync(path.join(komoHome(), "gateway.json"), "utf8");
     const info = JSON.parse(raw);
@@ -43,9 +59,13 @@ function readGateway() {
 
 // The connection the renderer is currently bound to. Refreshed on every
 // `komo:connect`, so a gateway restart (new port/key) is picked up.
-let gateway = null;
+let gateway: Gateway | null = null;
 
-async function fetchWithTimeout(url, options, timeoutMs) {
+async function fetchWithTimeout(
+  url: string,
+  options: RequestInit,
+  timeoutMs: number,
+): Promise<Response> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
@@ -55,7 +75,7 @@ async function fetchWithTimeout(url, options, timeoutMs) {
   }
 }
 
-async function healthOk(base) {
+async function healthOk(base: string): Promise<boolean> {
   try {
     const res = await fetchWithTimeout(`${base}/health`, {}, PROBE_TIMEOUT_MS);
     return res.ok;
@@ -64,13 +84,16 @@ async function healthOk(base) {
   }
 }
 
-function registerIpc() {
+function registerIpc(): void {
   // Discover + probe the gateway. Returns connection status (never the key).
   ipcMain.handle("komo:connect", async () => {
     const found = readGateway();
     if (!found) {
       gateway = null;
-      return { connected: false, error: "未发现运行中的 komo gateway（启动 `komo gateway` 后自动连接）" };
+      return {
+        connected: false,
+        error: "未发现运行中的 komo gateway（启动 `komo gateway` 后自动连接）",
+      };
     }
     if (!(await healthOk(found.base))) {
       gateway = null;
@@ -81,7 +104,7 @@ function registerIpc() {
   });
 
   // Generic authenticated request against a /api/* or /v1/* path.
-  ipcMain.handle("komo:api", async (_evt, req) => {
+  ipcMain.handle("komo:api", async (_evt, req: ApiRequest) => {
     if (!gateway) return { ok: false, status: 0, error: "未连接" };
     const { path: p, method = "GET", body } = req ?? {};
     try {
@@ -105,17 +128,17 @@ function registerIpc() {
       }
       return { ok: true, status: res.status, data };
     } catch (err) {
-      return { ok: false, status: 0, error: String(err && err.message ? err.message : err) };
+      return { ok: false, status: 0, error: errMsg(err) };
     }
   });
 
   // One chat turn. `mode` picks the loopback session context: interactive
   // (approval/clarify suspend the turn, resolved out-of-band) or trusted
   // (side-effecting tools auto-approve, like `komo chat`).
-  ipcMain.handle("komo:chat", async (_evt, req) => {
+  ipcMain.handle("komo:chat", async (_evt, req: ChatRequest) => {
     if (!gateway) return { ok: false, error: "未连接" };
     const { header, message, mode } = req ?? {};
-    const headers = {
+    const headers: Record<string, string> = {
       Authorization: `Bearer ${gateway.key}`,
       "Content-Type": "application/json",
       "X-Komo-Session-Id": header,
@@ -141,21 +164,25 @@ function registerIpc() {
       const reply = data?.choices?.[0]?.message?.content ?? "";
       return { ok: true, reply };
     } catch (err) {
-      return { ok: false, error: String(err && err.message ? err.message : err) };
+      return { ok: false, error: errMsg(err) };
     }
   });
 }
 
-function createWindow() {
+function errMsg(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
+}
+
+function createWindow(): void {
   const win = new BrowserWindow({
     width: 1100,
     height: 780,
     minWidth: 720,
     minHeight: 520,
     title: "komo",
-    backgroundColor: "#16181c",
+    backgroundColor: "#07070d",
     webPreferences: {
-      preload: path.join(__dirname, "preload.cjs"),
+      preload: path.join(__dirname, "../preload/index.cjs"),
       contextIsolation: true,
       sandbox: true,
       nodeIntegration: false,
@@ -164,15 +191,16 @@ function createWindow() {
 
   // Open external links in the OS browser, never in-app.
   win.webContents.setWindowOpenHandler(({ url }) => {
-    shell.openExternal(url);
+    void shell.openExternal(url);
     return { action: "deny" };
   });
 
-  const devUrl = process.env.KOMO_ELECTRON_DEV;
+  // electron-vite injects the renderer dev URL; production loads the bundle.
+  const devUrl = process.env.ELECTRON_RENDERER_URL;
   if (devUrl) {
-    win.loadURL(devUrl);
+    void win.loadURL(devUrl);
   } else {
-    win.loadFile(path.join(__dirname, "..", "dist", "index.html"));
+    void win.loadFile(path.join(__dirname, "../renderer/index.html"));
   }
 }
 
