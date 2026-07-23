@@ -2,6 +2,14 @@
 @import "tw-animate-css";
 @import "./theme.css";
 
+/* This stylesheet is shared and lives outside each host's Vite root, so
+   Tailwind v4's automatic (cwd-rooted) content detection would miss the app
+   source and the host entries. Scan them explicitly (paths relative to this
+   file: styles → src → app → apps). */
+@source "../";
+@source "../../../desktop/src/renderer";
+@source "../../../web/src";
+
 /* Class-based dark mode: theme.css flips the tokens under html.dark, and this
    lets any `dark:` Tailwind utility follow the same signal. */
 @custom-variant dark (&:where(.dark, .dark *));

@@ -1,0 +1,8 @@
+{
+  "name": "komo-apps",
+  "private": true,
+  "version": "0.1.0",
+  "description": "JS/TS clients for komo — a shared React renderer (app) mounted by an Electron desktop shell (desktop) and a standalone web build (web), all talking to the gateway's HTTP api channel.",
+  "workspaces": ["app", "desktop", "web"],
+  "packageManager": "bun@1.3.14"
+}

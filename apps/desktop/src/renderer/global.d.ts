@@ -1,49 +1,13 @@
-// The IPC surface the preload exposes on `window.komo`.
+// The preload bridge exposed on `window.komoBridge`. Gateway discovery only —
+// the renderer's HttpKomoClient (from @komo/app) does all HTTP itself.
 
-export interface KomoApiRequest {
-  path: string;
-  method?: "GET" | "POST";
-  body?: unknown;
-}
-export interface KomoApiResponse<T = unknown> {
-  ok: boolean;
-  status: number;
-  data?: T;
-  error?: string;
-}
-export interface KomoChatRequest {
-  header: string;
-  message: string;
-  mode: "interactive" | "trusted";
-}
-export interface KomoChatResponse {
-  ok: boolean;
-  reply?: string;
-  error?: string;
-}
-export interface KomoConnectResponse {
-  connected: boolean;
-  base?: string;
-  error?: string;
-}
-
-/** A live tool-call event streamed during a turn (mirrors komo's `TurnEvent`). */
-export type TurnEvent =
-  | { type: "tool_started"; seq: number; name: string; args: string }
-  | { type: "tool_finished"; seq: number; name: string; ok: boolean; summary: string };
-
-export interface ToolEventPayload {
-  session: string;
-  event: TurnEvent;
-}
+import type { Gateway } from "@komo/app";
 
 declare global {
   interface Window {
-    komo: {
-      connect(): Promise<KomoConnectResponse>;
-      api<T = unknown>(req: KomoApiRequest): Promise<KomoApiResponse<T>>;
-      chat(req: KomoChatRequest): Promise<KomoChatResponse>;
-      onToolEvent(cb: (payload: ToolEventPayload) => void): () => void;
+    komoBridge: {
+      /** The current gateway endpoint, or null when none is running. */
+      gateway(): Promise<Gateway | null>;
     };
   }
 }

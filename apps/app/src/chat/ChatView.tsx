@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useMemo, useRef, useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   AssistantRuntimeProvider,
@@ -13,8 +13,16 @@ import {
 } from "@assistant-ui/react";
 
 import { useApp, useConnection } from "../app-context";
-import type { Interactions, PendingApproval, Run, RunDetail, RunStep, SessionMessage } from "../types";
-import type { TurnEvent } from "../global";
+import { getClient } from "../client/runtime";
+import type {
+  Interactions,
+  PendingApproval,
+  Run,
+  RunDetail,
+  RunStep,
+  SessionMessage,
+  TurnEvent,
+} from "../types";
 import { apiField, apiGet, headerFor } from "../lib/ipc";
 import { MarkdownText } from "@/components/assistant-ui/markdown-text";
 import { Button, buttonVariants } from "@/components/ui/button";
@@ -282,27 +290,24 @@ function ChatRuntime({ initialMessages }: { initialMessages: ThreadMessageLike[]
   const [tools, setTools] = useState<ToolActivity[]>([]);
   const toolsRef = useRef<ToolActivity[]>([]);
 
-  // Live tool-call feed: fold each streamed TurnEvent into the activity list.
-  useEffect(() => {
-    return window.komo.onToolEvent(({ session: eventSession, event }: { session: string; event: TurnEvent }) => {
-      if (eventSession !== headerFor(session)) return;
-      setTools((prev) => {
-        if (event.type === "tool_started") {
-          const next = prev.filter((t) => t.seq !== event.seq);
-          next.push({ seq: event.seq, name: event.name, args: event.args, done: false });
-          toolsRef.current = next;
-          return next;
-        }
-        const next = prev.map((t) =>
-          t.seq === event.seq
-            ? { ...t, done: true, ok: event.ok, summary: event.summary }
-            : t,
-        );
+  // Fold one streamed TurnEvent into the live activity list. Passed into
+  // `chat()` per turn (the client scopes the callback to this request, so no
+  // session filtering is needed — unlike the old global event subscription).
+  const applyToolEvent = (event: TurnEvent) => {
+    setTools((prev) => {
+      if (event.type === "tool_started") {
+        const next = prev.filter((t) => t.seq !== event.seq);
+        next.push({ seq: event.seq, name: event.name, args: event.args, done: false });
         toolsRef.current = next;
         return next;
-      });
+      }
+      const next = prev.map((t) =>
+        t.seq === event.seq ? { ...t, done: true, ok: event.ok, summary: event.summary } : t,
+      );
+      toolsRef.current = next;
+      return next;
     });
-  }, [session]);
+  };
 
   // One turn = one chat request. While it's in flight, poll the interactions
   // endpoint so an approval raises the modal and a clarify raises the answer
@@ -328,7 +333,7 @@ function ChatRuntime({ initialMessages }: { initialMessages: ThreadMessageLike[]
         let stop = false;
         const poll = (async () => {
           while (!stop) {
-            const r = await window.komo.api<Interactions>({ path });
+            const r = await getClient().api<Interactions>({ path });
             if (r.ok && r.data) {
               setApproval(r.data.approval ?? null);
               setQuestion(r.data.question ?? null);
@@ -337,11 +342,14 @@ function ChatRuntime({ initialMessages }: { initialMessages: ThreadMessageLike[]
           }
         })();
         try {
-          const res = await window.komo.chat({
-            header: headerFor(session),
-            message: text,
-            mode: modeGetter.current,
-          });
+          const res = await getClient().chat(
+            {
+              header: headerFor(session),
+              message: text,
+              mode: modeGetter.current,
+            },
+            applyToolEvent,
+          );
           if (!res.ok) throw new Error(res.error || "请求失败");
           // A brand-new session now exists server-side — surface it in the list.
           void qc.invalidateQueries({ queryKey: ["sessions"] });
@@ -370,7 +378,7 @@ function ChatRuntime({ initialMessages }: { initialMessages: ThreadMessageLike[]
 
   const decide = (decision: "once" | "session" | "deny") => {
     setApproval(null);
-    void window.komo.api({
+    void getClient().api({
       path: `/api/interactions/${encodeURIComponent(session)}/approval`,
       method: "POST",
       body: { decision },
@@ -379,7 +387,7 @@ function ChatRuntime({ initialMessages }: { initialMessages: ThreadMessageLike[]
 
   const answer = (text: string) => {
     setQuestion(null);
-    void window.komo.api({
+    void getClient().api({
       path: `/api/interactions/${encodeURIComponent(session)}/answer`,
       method: "POST",
       body: { text },

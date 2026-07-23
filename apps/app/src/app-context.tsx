@@ -1,6 +1,6 @@
 import { createContext, useContext } from "react";
 
-import type { KomoConnectResponse } from "./global";
+import type { KomoConnectResponse } from "./types";
 import type { Theme } from "./lib/theme";
 
 export type Mode = "interactive" | "trusted";

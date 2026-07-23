@@ -4,10 +4,14 @@ import react from "@vitejs/plugin-react";
 import tailwindcss from "@tailwindcss/vite";
 import { defineConfig } from "electron-vite";
 
-// Three-part build (main / preload / renderer), mirroring mineclaw's
-// electron-client. The renderer is a plain React + Vite app; main and preload
-// are bundled to CommonJS (`.cjs`) so the sandboxed preload and the Electron
-// main entry load without ESM friction.
+// Path to the shared renderer package's source. The renderer bundles it
+// directly (it's a source-only workspace package), so both `@komo/app` (the
+// barrel) and `@` (the app's internal alias) resolve here.
+const appSrc = fileURLToPath(new URL("../app/src", import.meta.url));
+
+// Three-part build (main / preload / renderer). Main and preload bundle to
+// CommonJS (`.cjs`) so the sandboxed preload and the Electron main entry load
+// without ESM friction. The renderer is a thin host that mounts @komo/app.
 export default defineConfig({
   main: {
     build: {
@@ -33,7 +37,10 @@ export default defineConfig({
     root: fileURLToPath(new URL("./src/renderer", import.meta.url)),
     plugins: [tailwindcss(), react()],
     resolve: {
-      alias: { "@": fileURLToPath(new URL("./src/renderer", import.meta.url)) },
+      alias: {
+        "@komo/app": appSrc,
+        "@": appSrc,
+      },
     },
     build: {
       outDir: fileURLToPath(new URL("./dist/renderer", import.meta.url)),

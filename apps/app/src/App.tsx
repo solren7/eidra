@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 
-import type { KomoConnectResponse } from "./global";
+import type { KomoConnectResponse } from "./types";
+import { getClient } from "./client/runtime";
 import { AppContext, ConnectionContext, type Mode } from "./app-context";
 import { ChatView } from "./chat/ChatView";
 import { Sidebar } from "./Sidebar";
@@ -29,7 +30,7 @@ export function App() {
   useEffect(() => {
     let alive = true;
     const tick = async () => {
-      const r = await window.komo.connect();
+      const r = await getClient().connect();
       if (alive) setConn(r);
     };
     void tick();

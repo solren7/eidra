@@ -1,57 +1,63 @@
-# komo — Electron desktop demo
+# komo — Electron desktop shell
 
-A second desktop client for komo, using the **Electron + Vite + React + TypeScript
-+ @assistant-ui/react + @tanstack/react-query** stack (the same shape as
-hermes-agent's desktop shell). It's the JS sibling of the Rust
-[`crates/komo-gui`](../../crates/komo-gui) Dioxus client — both are pure HTTP
-front ends over the gateway's api channel.
+A thin Electron host over the shared [`@komo/app`](../app) renderer. The same
+React app runs here and in the standalone [web build](../web); this package only
+adds a native window and gateway discovery. It's the JS sibling of the Rust
+[`crates/komo-gui`](../../crates/komo-gui) Dioxus client — all pure HTTP front
+ends over the gateway's api channel.
 
 ## What it does
 
 - **Auto-discovers** a running gateway via `~/.komo/gateway.json` (read in the
-  Electron main process; the bearer key never enters the renderer).
-- **Chat** built on `@assistant-ui/react` primitives (`useLocalRuntime` +
-  `ChatModelAdapter`), replies rendered as sanitized markdown (marked +
-  DOMPurify — injected HTML is neutralized).
-- **Interactive tool approval + clarify**: while a turn is in flight the app
-  polls `/api/interactions/{session}`; an approval raises a modal (approve
-  once / this session / deny), a clarify question raises an inline answer bar.
-  Both resolve out-of-band over the loopback POST endpoints. A **trusted-mode**
-  toggle switches to auto-approve (like `komo chat`).
-- **Dashboard** with TanStack Query: status, tasks, memories (with
-  promote/pin/reject), runs (expand for steps), sessions ("continue in chat").
-  Only the active tab polls.
+  Electron main process, re-read on each connection tick so a restart's new
+  port/key is picked up).
+- Everything else — chat (`@assistant-ui/react`), interactive tool
+  approval + clarify (polling `/api/interactions/{session}`), the
+  status/tasks/memories/runs dashboard, session rename/archive/delete — lives in
+  `@komo/app` and is shared with the web build. See [../app](../app).
 
 ## Architecture
 
-- **Main process** (`electron/main.cjs`): gateway discovery + all HTTP calls,
-  exposed to the renderer as `komo:connect` / `komo:api` / `komo:chat` over IPC.
-  The renderer is sandboxed (`contextIsolation`, no node integration).
-- **Preload** (`electron/preload.cjs`): the only bridge — `window.komo`.
-- **Renderer** (`src/`): React 19 + Vite. `App.tsx` runs the connection
-  lifecycle and view switch; `chat/ChatView.tsx` is the assistant-ui thread;
-  `dashboard/Dashboard.tsx` is the TanStack-driven panels.
+The renderer is platform-agnostic and talks to the gateway only through a
+`KomoClient` (see `@komo/app`'s `client/`). This shell wires up the one HTTP
+implementation with a desktop-specific gateway resolver:
 
-Single request/response per turn — komo has no token streaming yet, so there's
-no WebSocket layer (unlike hermes). A turn suspends server-side for
-approval/clarify and the same HTTP request returns the final reply.
+- **Main** (`src/main/index.ts`): gateway discovery only. Reads
+  `~/.komo/gateway.json` and returns `{base, key}` over a single IPC channel
+  (`komo:gateway`). No HTTP proxying — the renderer calls the gateway directly.
+- **Preload** (`src/preload/index.ts`): the only bridge — `window.komoBridge.gateway()`.
+- **Renderer** (`src/renderer/main.tsx`): builds `new HttpKomoClient(resolver)`
+  over that bridge, installs it with `setClient`, and mounts `<App/>` from
+  `@komo/app`. The renderer stays sandboxed (`contextIsolation`, no node
+  integration).
+
+Unlike the earlier REST-over-IPC design, the bearer key now lives in the
+renderer — the deliberate trade for sharing one client with the web build (where
+the key must reach the browser regardless). The renderer is sandboxed and the
+key is loopback/key-scoped on the gateway side.
+
+Single request/response per turn — komo streams tool-call events over SSE but
+not token deltas, so a turn suspends server-side for approval/clarify and the
+same HTTP request returns the final reply.
 
 ## Run
 
-Start a komo gateway first (so `~/.komo/gateway.json` exists), then:
+Install once at the workspace root (`apps/`), then start a komo gateway (so
+`~/.komo/gateway.json` exists), then:
 
 ```bash
-cd apps/electron-demo
-npm install
-npm run dev      # Vite renderer + Electron with hot reload
-# or
-npm run build && npm start   # production build, then launch
+cd apps && bun install
 ```
+
+```bash
+cd apps/desktop && bun run dev
+```
+
+`bun run build && bun run start` does a production build then launches.
 
 ## Known limitations (demo scope)
 
 - No token streaming (spinner + whole reply), mirroring the backend.
 - "Continue in chat" resumes the **server-side** session context (history
-  threads correctly) but the visible transcript starts empty — past messages
-  aren't re-hydrated into the assistant-ui thread.
-- Not packaged (`electron-builder`); `npm run dev` / `start` only.
+  threads correctly); past messages are re-hydrated from the run ledger.
+- Not packaged (`electron-builder`); `dev` / `start` only.

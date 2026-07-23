@@ -2,6 +2,7 @@ import { useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 
 import { useApp, useConnection } from "./app-context";
+import { getClient } from "./client/runtime";
 import { apiField, fmtTs, newSessionId } from "./lib/ipc";
 import type { SessionSummary } from "./types";
 import { Button } from "@/components/ui/button";
@@ -40,7 +41,7 @@ export function Sidebar({ onOpenSettings }: { onOpenSettings: () => void }) {
   const commitRename = async (id: string) => {
     const title = draft.trim();
     setEditingId(null);
-    await window.komo.api({
+    await getClient().api({
       path: `/api/sessions/${encodeURIComponent(id)}/title`,
       method: "POST",
       body: { title },
@@ -49,7 +50,7 @@ export function Sidebar({ onOpenSettings }: { onOpenSettings: () => void }) {
   };
 
   const setStatus = async (id: string, status: string) => {
-    await window.komo.api({
+    await getClient().api({
       path: `/api/sessions/${encodeURIComponent(id)}/status`,
       method: "POST",
       body: { status },

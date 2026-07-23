@@ -1,7 +1,9 @@
-// Thin typed helpers over the `window.komo` IPC bridge.
+// Thin typed helpers over the injected `KomoClient` (see `client/runtime.ts`).
+
+import { getClient } from "../client/runtime";
 
 export async function apiGet<T>(path: string): Promise<T> {
-  const r = await window.komo.api<T>({ path, method: "GET" });
+  const r = await getClient().api<T>({ path, method: "GET" });
   if (!r.ok) throw new Error(r.error || `HTTP ${r.status}`);
   return r.data as T;
 }
@@ -13,7 +15,7 @@ export async function apiField<T>(path: string, key: string): Promise<T> {
 }
 
 export async function apiPost<T = unknown>(path: string, body?: unknown): Promise<T> {
-  const r = await window.komo.api<T>({ path, method: "POST", body });
+  const r = await getClient().api<T>({ path, method: "POST", body });
   if (!r.ok) throw new Error(r.error || `HTTP ${r.status}`);
   return r.data as T;
 }
